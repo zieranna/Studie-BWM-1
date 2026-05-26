@@ -12,7 +12,7 @@ The master script `comBIND.py` orchestrates all stages, from preprocessing throu
 
 ```
 Analysis/
-├── comBIND.py                  ← master orchestration script (this file)
+├── comBIND.py                  ← master orchestration script 
 │
 ├── 01_run_fmriprep.py                  ← Stage 1a: fMRIPrep preprocessing
 ├── 02_trialestimates.py                ← Stage 1b: per-trial FIR-stick GLM
@@ -118,7 +118,7 @@ Runs the `create_subj_volume_parcellation.sh` script to project the HCP-MMP1 atl
 
 ## Configuration
 
-Edit the variables at the top of `00_run_pipeline.py` before running:
+Edit the variables at the top of `comBIND.py` before running:
 
 | Variable | Description |
 |----------|-------------|
