@@ -1,5 +1,6 @@
 # Studie-BWM-1
-scripts sorted to analyze the dataset of Studie-BWM-1, can be downloaded on openneuro.org
+Scripts sorted to analyze the dataset of Studie-BWM-1, can be downloaded on openneuro.org (doi:10.18112/openneuro.ds007819.v1.0.0) 
+Data will be published upon publication and can currently only be accessed using an Anonymous Reviewer Link. 
 
 # BindingWM Studie-BWM-1 — Analysis Pipeline
 
