@@ -85,12 +85,12 @@ Studie-BWM-1/bindingWM/
 
 Runs sequentially for each subject (`sub-01` … `sub-20`).
 
-| Step | Script | Description |
-|------|--------|-------------|
-| 1a | `01_run_fmriprep.py` | Runs fMRIPrep via Docker |
-| 1b | `02_trialestimates.py` | Per-run FIR-stick GLM; produces one t-map per trial per phase |
-| 1c | `03_postprocess_tmaps.py` | Z-scores t-maps per run, renames run-NN → block-NN, pair-averages a+b trials |
-| 1d | `04_fullmodel.py` | Full-subject FIR GLM; produces whole-brain encoding and delay phase t-maps |
+| Step | Script | Description                                                                           |
+|------|--------|---------------------------------------------------------------------------------------|
+| 1a | `01_run_fmriprep.py` | Runs fMRIPrep via Docker                                                              |
+| 1b | `02_trialestimates.py` | Per-run FIR-stick GLM; produces one t-map per trial per phase                         |
+| 1c | `03_postprocess_tmaps.py` | Z-scores t-maps per run, renames run-NN → block-NN, pair-averages a+b trials          |
+| 1d | `04_fullmodel.py` | Full-subject FIR GLM; produces whole-brain encoding and delay phase t-maps and z-maps |
 
 ### Stage 2 — HCP-MMP1 parcellation (run once)
 
@@ -140,8 +140,8 @@ Edit the variables at the top of `00_run_pipeline.py` before running:
 
 ## Requirements
 
-- Python 3.x with `nilearn`, `numpy`, `scikit-learn`
-- [fMRIPrep](https://fmriprep.org) (Docker)
+- Python environment as in the environment.yml 
+- [fMRIPrep](23.0.2) (Docker)
 - FreeSurfer (for HCP-MMP1 parcellation)
 - A valid FreeSurfer license file
 
@@ -150,7 +150,7 @@ Edit the variables at the top of `00_run_pipeline.py` before running:
 ## Running the pipeline
 
 ```bash
-python 00_run_pipeline.py
+python comBIND.py
 ```
 
 The script prints each shell command before executing it and warns (but does not abort) on non-zero exit codes, so partial failures can be identified in the log without halting the full run.
