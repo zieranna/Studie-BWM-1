@@ -58,14 +58,29 @@ Resampled ROI masks are cached next to the ROI masks
 checked against the reference grid, so several jobs (e.g. SLURM array
 tasks for the same subject) can run at the same time.
 
-Inputs
-------
-Two sources from ``05_postprocess_tmaps.py``:
+Inputs (--layout)
+-----------------
+fir (default): maps of the original FIR model (``05_postprocess_tmaps.py``)
 
     * Pair-averaged maps (tmap_pair/)  -- analyses whose unit of
       decoding is a paper PAIR (binding, color, motion).
-    * Per-trial z-scored maps (tmap_z/) -- analyses whose unit is a
-      single trial (temporal_order, binding_interaction).
+    * Per-trial maps (tmap_z/, z-scored; or another folder via
+      --trial-subdir, e.g. tmap_trial/ from 03b_average_runs.py) --
+      analyses whose unit is a single trial (temporal_order,
+      binding_interaction).
+
+    <tmap-dir>/sub-XX/model/fir/binding/{tmap_pair,tmap_z}/<phase>/,
+    --phase enc | del | res.
+
+lss: single-trial estimates of ``02b_trialestimates_lss.py`` (pair maps
+     from ``03b_average_runs.py``)
+
+    <tmap-dir>/sub-XX/<model>/<stat>/<window>/pairs/    pair analyses
+    <tmap-dir>/sub-XX/<model>/<stat>/<window>/trials/   trial analyses
+
+    --phase gives <model>/<stat>/<window>, e.g. hrf/beta/del or
+    fir/tmap/del_w10-13. Output file names use it with '-' instead of
+    '/' (hrf-beta-del).
 
 ROI masks come from ``07_create_top_voxel_rois.py``.
 
@@ -78,6 +93,7 @@ outer fold.
 
 Output
 ------
+<phase> in file names is the phase tag (--layout lss: hrf-beta-del).
 fixed:
     <output-dir>/sub-XX/<analysis>/decoding_<analysis>_<phase>_<date>.xlsx
       sheet 'per_pair' -- one row per (pair, ROI, voxels)
@@ -116,10 +132,11 @@ warnings.filterwarnings("ignore")
 # Constants
 # ============================================================================
 N_BLOCKS_PER_SESSION = 4
+FIR_PHASES = ("enc", "del", "res")      # --phase values for --layout fir
 
 # Each analysis: (kind, [(A_label, B_label), ...]).
-#   kind="pair"  -> reads tmap_pair/, labels are paper pair numbers ('4', '13')
-#   kind="trial" -> reads tmap_z/,    labels are PAPER trial labels ('4a', '13b')
+#   kind="pair"  -> reads tmap_pair/ (lss: pairs/),  labels are paper pair numbers ('4', '13')
+#   kind="trial" -> reads tmap_z/    (lss: trials/), labels are PAPER trial labels ('4a', '13b')
 ANALYSES = {
     "binding": ("pair", [
         ("4", "3"),  ("6", "5"),  ("2", "1"),
@@ -202,18 +219,32 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--subject", required=True, type=str,
                    help="Participant label without 'sub-' (e.g. '01').")
-    p.add_argument("--phase", required=True, choices=["enc", "del", "res"],
-                   help="FIR phase to decode.")
+    p.add_argument("--phase", required=True,
+                   help="--layout fir: FIR phase (enc, del, res). --layout lss: "
+                        "<model>/<stat>/<window>, e.g. hrf/beta/del, "
+                        "fir/tmap/del_w10-13.")
     p.add_argument("--analysis", required=True, choices=list(ANALYSES.keys()),
                    help="Which A-vs-B label list to use.")
     p.add_argument("--tmap-dir", required=True, type=Path,
-                   help="Root of 05_postprocess_tmaps.py output (the folder "
-                        "that contains sub-XX/).")
+                   help="--layout fir: root of 05_postprocess_tmaps.py output. "
+                        "--layout lss: root of 02b_trialestimates_lss.py output. "
+                        "In both cases the folder that contains sub-XX/.")
     p.add_argument("--roi-dir", required=True, type=Path,
                    help="Root of 07_create_top_voxel_rois.py output (the "
                         "folder that contains sub-XX/<ROI>/topNNNN.nii.gz).")
     p.add_argument("--output-dir", required=True, type=Path,
                    help="Where decoding tables will be written.")
+    p.add_argument("--layout", choices=["fir", "lss"], default="fir",
+                   help="'fir' (default): original FIR maps, "
+                        "sub-XX/model/fir/binding/{tmap_pair,tmap_z}/<phase>/. "
+                        "'lss': LSS estimates, "
+                        "sub-XX/<model>/<stat>/<window>/{pairs,trials}/.")
+    p.add_argument("--trial-subdir", default="tmap_z",
+                   help="--layout fir only. Folder of the single-trial maps for "
+                        "trial-level analyses (temporal_order, "
+                        "binding_interaction): 'tmap_z' (z-scored, "
+                        "05_postprocess_tmaps.py, default) or 'tmap_trial' "
+                        "(not z-scored, 03b_average_runs.py).")
     p.add_argument("--n-jobs", type=int, default=DEFAULT_N_JOBS,
                    help=f"Outer parallel workers (default {DEFAULT_N_JOBS}). "
                         "Each worker runs its fits serially inside.")
@@ -245,20 +276,45 @@ def parse_args() -> argparse.Namespace:
                         "fixed-count run with the nested engine.")
     p.add_argument("--seed", type=int, default=0,
                    help="nested only. random_state for LinearSVC.")
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.layout == "fir":
+        if args.phase not in FIR_PHASES:
+            p.error(f"--layout fir: --phase must be one of {', '.join(FIR_PHASES)} "
+                    f"(got '{args.phase}'). For LSS estimates add --layout lss.")
+    else:
+        args.phase = args.phase.strip("/")
+        if len(args.phase.split("/")) != 3:
+            p.error("--layout lss: --phase must be <model>/<stat>/<window>, "
+                    f"e.g. hrf/beta/del (got '{args.phase}').")
+        args.trial_subdir = "lss"      # routes all path look-ups to the LSS layout
+    args.phase_tag = args.phase.replace("/", "-")   # for file names: hrf-beta-del
+    return args
 
 
 # ============================================================================
 # Path helpers
 # ============================================================================
-def tmap_phase_dir(tmap_root: Path, sub: str, phase: str, kind: str) -> Path:
-    subdir = "tmap_pair" if kind == "pair" else "tmap_z"
+def tmap_phase_dir(tmap_root: Path, sub: str, phase: str, kind: str,
+                   trial_subdir: str = "tmap_z") -> Path:
+    """Folder with the maps of one phase and kind.
+
+    trial_subdir == "lss" selects the LSS layout of 02b_trialestimates_lss.py:
+    <root>/sub-XX/<model>/<stat>/<window>/{pairs,trials}/, phase =
+    "<model>/<stat>/<window>".
+    """
+    if trial_subdir == "lss":
+        return (tmap_root / f"sub-{sub}" / phase /
+                ("pairs" if kind == "pair" else "trials"))
+    subdir = "tmap_pair" if kind == "pair" else trial_subdir
     return tmap_root / f"sub-{sub}" / "model" / "fir" / "binding" / subdir / phase
 
 
 def find_files(tmap_root: Path, sub: str, phase: str,
-               kind: str, label: str) -> list:
-    return sorted(tmap_phase_dir(tmap_root, sub, phase, kind).glob(
+               kind: str, label: str, trial_subdir: str = "tmap_z") -> list:
+    # '*' after block- also covers the run entity of LSS trial maps
+    # (sub-XX_ses-YY_block-BB_run-NN_trial-4a.nii.gz).
+    return sorted(tmap_phase_dir(tmap_root, sub, phase, kind, trial_subdir).glob(
         f"sub-{sub}_ses-*_block-*_{kind}-{label}.nii.gz"))
 
 
@@ -333,6 +389,7 @@ def decode_one_combo(
     a_label: str,
     b_label: str,
     mask_path: Path,
+    trial_subdir: str = "tmap_z",
 ) -> float:
 
     print(f"Running pair {a_label} vs {b_label} - ROI {mask_path.parent.name} top{mask_path.stem.split('top')[-1]} ...")
@@ -345,8 +402,8 @@ def decode_one_combo(
 
     imgs = []
 
-    files_a = find_files(tmap_root, sub, phase, kind, a_label)
-    files_b = find_files(tmap_root, sub, phase, kind, b_label)
+    files_a = find_files(tmap_root, sub, phase, kind, a_label, trial_subdir)
+    files_b = find_files(tmap_root, sub, phase, kind, b_label, trial_subdir)
 
     if len(files_a) == 0 or len(files_b) == 0:
         raise FileNotFoundError(
@@ -494,7 +551,7 @@ def run_fixed(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
         try:
             acc = decode_one_combo(
                 args.tmap_dir, args.subject, args.phase,
-                kind, a, b, mask_path,
+                kind, a, b, mask_path, args.trial_subdir,
             )
         except Exception as e:
             print(f"  [error] pair {pair_idx} ({a} vs {b}) "
@@ -527,7 +584,7 @@ def run_fixed(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     # Save per_pair FIRST as a safety net (so a later failure doesn't
     # lose the decoder fits we just spent N minutes computing).
     # ------------------------------------------------------------------
-    out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase}_{today}.xlsx"
+    out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase_tag}_{today}.xlsx"
     df.to_excel(out_xlsx, sheet_name="per_pair", index=False)
     print(f"\nSaved per_pair to {out_xlsx}")
 
@@ -557,7 +614,7 @@ def run_fixed(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
         df.to_excel(xl, sheet_name="per_pair", index=False)
         summary.to_excel(xl, sheet_name="summary", index=False)
     print(f"Saved {out_xlsx}")
-    return f"decoding_script_{args.analysis}_{args.phase}_{today}.py"
+    return f"decoding_script_{args.analysis}_{args.phase_tag}_{today}.py"
 
 
 # ============================================================================
@@ -583,6 +640,7 @@ def pick_index(scores: np.ndarray, tie_break: str) -> int:
 def load_roi_indices(roi_dir: Path, sub: str, roi_voxels: dict,
                      ref_path: Path) -> dict:
     """{roi: {n_vox: flat C-order voxel indices on the t-map grid}}."""
+    ref = nib.load(str(ref_path))
     out = {}
     for roi, voxel_list in roi_voxels.items():
         idx = {}
@@ -591,7 +649,13 @@ def load_roi_indices(roi_dir: Path, sub: str, roi_voxels: dict,
             if not rp.exists():
                 print(f"  [warn] missing mask {rp}")
                 continue
-            m = nib.load(str(ensure_resampled_roi(rp, ref_path))).get_fdata()
+            rs = nib.load(str(ensure_resampled_roi(rp, ref_path)))
+            if not _on_grid(rs, ref):
+                # Another job replaced the cache with a different grid
+                # between the check and this load; never use wrong indices.
+                raise RuntimeError(f"{resampled_mask_path(rp)} is not on the grid "
+                                   f"of {ref_path.name}; rerun this job.")
+            m = rs.get_fdata()
             idx[n_vox] = np.flatnonzero(m.reshape(-1) > 0)
         if not idx:
             continue
@@ -605,13 +669,16 @@ def load_roi_indices(roi_dir: Path, sub: str, roi_voxels: dict,
 
 
 def load_patterns(tmap_root: Path, sub: str, phase: str, kind: str,
-                  labels: list, flat_idx: np.ndarray, ref_img) -> dict:
+                  labels: list, flat_idx: np.ndarray, ref_img,
+                  trial_subdir: str = "tmap_z") -> dict:
     """Load every map once: {label: (X [n_blocks, n_vox], block ids)}."""
     data = {}
     for lab in labels:
-        files = find_files(tmap_root, sub, phase, kind, lab)
+        files = find_files(tmap_root, sub, phase, kind, lab, trial_subdir)
         if not files:
-            raise FileNotFoundError(f"No maps for label {lab}")
+            raise FileNotFoundError(
+                f"No maps for label {lab} in "
+                f"{tmap_phase_dir(tmap_root, sub, phase, kind, trial_subdir)}")
         X = np.empty((len(files), flat_idx.size), dtype=np.float32)
         g = np.empty(len(files), dtype=int)
         for r, f in enumerate(files):
@@ -724,7 +791,8 @@ def run_nested(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     print(f"Loading maps for {len(labels)} labels "
           f"({all_idx.size} voxels in the ROI union) ...")
     data_all = load_patterns(args.tmap_dir, args.subject, args.phase, kind,
-                             labels, all_idx, nib.load(str(ref_path)))
+                             labels, all_idx, nib.load(str(ref_path)),
+                             args.trial_subdir)
     groups = np.unique(np.concatenate([g for _, g in data_all.values()]))
     print(f"  {sum(len(g) for _, g in data_all.values())} maps, "
           f"{len(groups)} blocks (outer folds).")
@@ -765,7 +833,7 @@ def run_nested(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     tag = f"nested-{args.selection_scope}"
     if args.fixed_c is not None:
         tag += f"_C{args.fixed_c:g}"
-    out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase}_{tag}_{today}.xlsx"
+    out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase_tag}_{tag}_{today}.xlsx"
 
     # Safety net: save the raw fold table before aggregating.
     folds.to_excel(out_xlsx, sheet_name="folds", index=False)
@@ -820,7 +888,7 @@ def run_nested(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
         folds.to_excel(xl, sheet_name="folds", index=False)
         inner_curve.to_excel(xl, sheet_name="inner_curve", index=False)
     print(f"Saved {out_xlsx}")
-    return f"decoding_script_{args.analysis}_{args.phase}_{tag}_{today}.py"
+    return f"decoding_script_{args.analysis}_{args.phase_tag}_{tag}_{today}.py"
 
 
 # ============================================================================
@@ -839,6 +907,8 @@ def main() -> None:
         print(f"  {k:>15}: {v}")
     print(f"  {'kind':>15}: {kind}")
     print(f"  {'n_pairs':>15}: {len(pair_list)}")
+    print(f"  {'input':>15}: "
+          f"{tmap_phase_dir(args.tmap_dir, args.subject, args.phase, kind, args.trial_subdir)}")
     print("-" * 64)
 
     out_dir = args.output_dir / f"sub-{args.subject}" / args.analysis
@@ -849,15 +919,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     ref_path = None
     for a, _ in pair_list:
-        ref_files = find_files(args.tmap_dir, args.subject, args.phase, kind, a)
+        ref_files = find_files(args.tmap_dir, args.subject, args.phase, kind, a,
+                               args.trial_subdir)
         if ref_files:
             ref_path = ref_files[0]
             break
     if ref_path is None:
         # Non-zero exit so the SLURM task is marked FAILED, not COMPLETED.
-        raise SystemExit("ERROR: no t-map files found in "
-                         f"{tmap_phase_dir(args.tmap_dir, args.subject, args.phase, kind)}. "
-                         "Check --tmap-dir and --phase.")
+        raise SystemExit(
+            "ERROR: no maps found in "
+            f"{tmap_phase_dir(args.tmap_dir, args.subject, args.phase, kind, args.trial_subdir)}. "
+            "Check --tmap-dir, --phase and --layout.")
 
     today = time.strftime("%Y%m%d")
     if args.voxel_selection == "nested":
