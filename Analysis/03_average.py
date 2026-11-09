@@ -81,7 +81,7 @@ def average_estimate(est_dir: Path, sub: str, force: bool) -> tuple:
             continue
         a_img, b_img = nib.load(str(members["a"])), nib.load(str(members["b"]))
         avg = (a_img.get_fdata(dtype=np.float32) + b_img.get_fdata(dtype=np.float32)) / 2.0
-        nib.Nifti1Image(avg, a_img.affine, a_img.header).to_filename(str(out))
+        nib.Nifti1Image(avg.astype(np.float32), a_img.affine).to_filename(str(out))   # float32, not the trial header's dtype
         n_avg += 1
     return n_avg, n_skip
 

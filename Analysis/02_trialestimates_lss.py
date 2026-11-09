@@ -165,6 +165,7 @@ HRF_MODEL = "spm"
 HIGH_PASS = 0.01                                 # Hz, as in 02_trialestimates.py
 # nilearn warns that FIR sticks have duration 0; that is intended.
 warnings.filterwarnings("ignore", message=".*null duration.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*boolean values for 'standardize'.*")
 
 MOTION_COLS = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
@@ -537,6 +538,15 @@ def process_run(args, ses: str, run: str) -> None:
                                             img, args.extra_mask_dir)
     masker = NiftiMasker(mask_img=mask_img, standardize=False).fit()
     Y = masker.transform(img).astype(np.float64)
+    # Voxels without signal (constant, e.g. 0 outside the BOLD field of view) would be
+    # scaled to a constant and give meaningless t values: leave them out of the fit.
+    has_signal = Y.std(axis=0) > 0
+    in_fit = np.asanyarray(mask_img.dataobj) > 0
+    fit_data = np.zeros(in_fit.shape, np.uint8)
+    fit_data[in_fit] = has_signal                  # masker order = boolean indexing of the mask
+    fit_mask = new_img_like(mask_img, fit_data)
+    if not has_signal.all():
+        print(f"   {int((~has_signal).sum())} voxels without signal left out of the fit", flush=True)
     extra = f" ({n_added} ROI voxels outside the brain mask added)" if n_added else ""
     print(f"   {len(trials)} trials, {Y.shape[1]} voxels{extra}, "
           f"loaded in {time.time() - t0:.0f} s", flush=True)
@@ -585,7 +595,7 @@ def process_run(args, ses: str, run: str) -> None:
     def one_trial(trial):
         X = make_design(frame_times, lss_events(ev, trial, args.basis),
                         args.basis, confounds)
-        glm = FirstLevelModel(t_r=TR, mask_img=mask_img, noise_model=args.noise_model,
+        glm = FirstLevelModel(t_r=TR, mask_img=fit_mask, noise_model=args.noise_model,
                               signal_scaling=scaling, standardize=False,
                               smoothing_fwhm=None, minimize_memory=True, n_jobs=1)
         glm.fit(img, design_matrices=[X])
@@ -597,7 +607,9 @@ def process_run(args, ses: str, run: str) -> None:
                 if op.exists() and not args.force:
                     continue
                 op.parent.mkdir(parents=True, exist_ok=True)
-                glm.compute_contrast(vec, output_type=out_type[stat]).to_filename(str(op))
+                con_img = glm.compute_contrast(vec, output_type=out_type[stat])
+                # float32 with a fresh header: never inherit an integer data type (uint8 = 256 levels)
+                nib.Nifti1Image(con_img.get_fdata(dtype=np.float32), con_img.affine).to_filename(str(op))
         return {"subject": sub, "session": ses, "run": run, "trial": trial,
                 "basis": args.basis, "motion": not args.no_motion,
                 "signal_scaling": not args.no_signal_scaling, **timing,

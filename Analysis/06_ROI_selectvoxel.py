@@ -10,6 +10,8 @@ encoding-phase whole-brain contrast map from 06_run_full_fir_glm.py.
 Anatomical ROIs (resampled into BOLD space by 02_create_rois.py):
 
     V1, V2, V3, V4, early_visual, pari, dlpfc
+    revision (05b_create_ROIs_revision.py): visual_all, visual_locMT, MT_complex,
+    dlpfc_noSFL
 
 Voxel selection
 ---------------
@@ -19,6 +21,11 @@ Top |t|-value voxels per ROI:
     early_visual         : 200..1000 in 100 steps, plus 2000, 3000
     pari                 : 200..1000 in 100 steps, plus 2000, 3000
     dlpfc                : 200..1000 in 100 steps, plus 2000, 3000
+    visual_all, visual_locMT,
+    MT_complex, dlpfc_noSFL : as early_visual
+
+If an ROI has fewer voxels than N, topN contains the whole ROI (a warning
+is printed).
 
 Output layout
 -------------
@@ -49,13 +56,17 @@ _SMALL = [200, 300, 400, 500, 600, 700, 800, 900, 1000]
 _LARGE = _SMALL + [2000, 3000]
 
 ROI_VOXELS = {
-    "V1":           _SMALL,
-    "V2":           _SMALL,
-    "V3":           _SMALL,
-    "V4":           _SMALL,
-    "early_visual": _LARGE,
-    "pari":         _LARGE,
-    "dlpfc":        _LARGE,
+   #"V1":           _SMALL,
+   #"V2":           _SMALL,
+   #"V3":           _SMALL,
+   #"V4":           _SMALL,
+   #"early_visual": _LARGE,
+   #"pari":         _LARGE,
+   #"dlpfc":        _LARGE,
+    "visual_all":   _LARGE,
+    "visual_locMT": _LARGE,
+    "MT_complex":   _LARGE,
+    "dlpfc_noSFL":  _LARGE,
 }
 
 
@@ -99,6 +110,9 @@ def create_top_voxel_mask(roi_path: Path, tmap_path: Path,
     if len(masked) == 0:
         raise RuntimeError(f"No voxels inside ROI: {roi_path.name}")
 
+    if n_voxels > len(masked):
+        print(f"  [warn] {roi_path.name} has only {len(masked)} voxels: "
+              f"top{n_voxels:04d} = whole ROI")
     n_voxels = min(n_voxels, len(masked))
     flat_idx = np.flatnonzero(roi_data)
 

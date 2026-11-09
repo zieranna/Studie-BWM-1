@@ -190,6 +190,10 @@ ROI_VOXELS = {
     "early_visual": _LARGE,
     "pari":         _LARGE,
     "dlpfc":        _LARGE,
+    "visual_all":   _LARGE,
+    "visual_locMT": _LARGE,
+    "MT_complex":   _SMALL,
+    "dlpfc_noSFL":  _SMALL,
 }
 
 # SVM hyperparameters, shared by both modes (identical to the original grid).
