@@ -27,9 +27,9 @@ the encoding onsets of every events file of the session. The run's own
 events must fit best (largest t, by ASSIGN_MARGIN); otherwise the run is
 flagged in the log and the QC table (assign_best_run, assign_margin).
 
---basis fir  (the paper's time windows, but ~320 instead of ~46 residual df)
-    Encoding-onset sticks with the 17 FIR delays, once for the target trial
-    and once for all other trials (34 columns instead of 306). Phase
+--basis fir  (the paper's time windows, but ~300 instead of ~46 residual df)
+    Encoding-onset sticks with 25 FIR delays (30 s, as 04_fullmodel.py), once
+    for the target trial and once for all other trials (50 columns). Phase
     estimates average the target's FIR delays exactly as in
     02_trialestimates.py (enc 3-6, del 9-12, res 14-17). Because the other
     trials now share columns, their volumes inform the baseline, drift and
@@ -103,7 +103,7 @@ from nilearn.masking import compute_epi_mask
 # Constants
 # ============================================================================
 TR = 1.2
-FIR_DELAYS = list(range(1, 18))                  # 17 delays * 1.2 s = 20.4 s
+FIR_DELAYS = list(range(1, 26))                  # 25 delays * 1.2 s = 30 s (as 04_fullmodel.py)
 # Time windows for --basis fir: {window: code delays}. Every window becomes an
 # window folder fir/<stat>/<window>. Seconds after encoding onset = delay * 1.2.
 # Windows without "_" (enc, del, res) are the main ones (--windows main).
@@ -117,6 +117,12 @@ FIR_WINDOWS = {
     "del_w09-11": [9, 10, 11],                   # 10.8-13.2 s
     "del_w10-12": [10, 11, 12],                  # 12.0-14.4 s
     "del_w08-13": [8, 9, 10, 11, 12, 13],        #  9.6-15.6 s
+    # --- delay windows starting right after the encoding window (enc = 3-6) --
+    "del_w07-09": [7, 8, 9],                     #  8.4-10.8 s
+    "del_w07-10": [7, 8, 9, 10],                 #  8.4-12.0 s
+    "del_w07-11": [7, 8, 9, 10, 11],             #  8.4-13.2 s
+    "del_w07-12": [7, 8, 9, 10, 11, 12],         #  8.4-14.4 s
+    "del_w07-13": [7, 8, 9, 10, 11, 12, 13],     #  8.4-15.6 s
     # --- negative control: before the hemodynamic response rises -----------
     "pre_01-02":  [1, 2],                        #  1.2-2.4 s
 }

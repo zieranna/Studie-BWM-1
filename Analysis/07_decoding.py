@@ -280,6 +280,10 @@ def parse_args() -> argparse.Namespace:
                         "fixed-count run with the nested engine.")
     p.add_argument("--seed", type=int, default=0,
                    help="nested only. random_state for LinearSVC.")
+    p.add_argument("--standardize", choices=["none", "zscore_sample"], default="none",
+                   help="nested only. 'zscore_sample': z-score every voxel with the mean and "
+                        "SD (ddof=1) of the training data of each split, applied to its test "
+                        "data (no leakage). Adds '_zscore' to the output name.")
     args = p.parse_args()
 
     if args.layout == "fir":
@@ -630,6 +634,18 @@ def make_svc(C: float, loss: str, seed: int) -> LinearSVC:
                      tol=SVC_TOL, max_iter=SVC_MAX_ITER, random_state=seed)
 
 
+def scale_split(Xa, Xb, standardize):
+    """z-score every voxel with mean and SD of the training part Xa (ddof=1, as
+    nilearn's 'zscore_sample') and apply them to Xa and Xb. Voxels without variance
+    keep SD 1. 'none' returns the data unchanged."""
+    if standardize == "none":
+        return Xa, Xb
+    mu = Xa.mean(axis=0)
+    sd = Xa.std(axis=0, ddof=1)
+    sd[sd == 0] = 1.0
+    return (Xa - mu) / sd, (Xb - mu) / sd
+
+
 def pick_index(scores: np.ndarray, tie_break: str) -> int:
     """Index of the best score; ties resolved by position (scores are
     ordered by ascending voxel count, or by grid order for C/loss)."""
@@ -698,7 +714,7 @@ def load_patterns(tmap_root: Path, sub: str, phase: str, kind: str,
 
 
 def nested_fold_job(roi, test_group, data, pos_by_n, pair_list, params,
-                    scope, tie_break, seed):
+                    scope, tie_break, seed, standardize="none"):
     """One ROI x one held-out block, all decoding sets of the analysis.
 
     Returns (fold_rows, curve_rows, error_message_or_None).
@@ -722,13 +738,16 @@ def nested_fold_job(roi, test_group, data, pos_by_n, pair_list, params,
             Xtr, ytr, gtr = X[tr], y[tr], g[tr]
             splits[k] = (Xtr, ytr, X[te], y[te])
             inner_cv = list(LeaveOneGroupOut().split(Xtr, ytr, gtr))
+            # optional z-scoring with the training part of each inner split
+            inner_sets = [scale_split(Xtr[itr], Xtr[ite], standardize) + (ytr[itr], ytr[ite])
+                          for itr, ite in inner_cv]
             for i, n in enumerate(counts):
-                Xn = Xtr[:, pos_by_n[n]]
+                cols = pos_by_n[n]
                 for j, (C, loss) in enumerate(params):
                     accs = []
-                    for itr, ite in inner_cv:
-                        clf = make_svc(C, loss, seed).fit(Xn[itr], ytr[itr])
-                        accs.append(np.mean(clf.predict(Xn[ite]) == ytr[ite]))
+                    for Atr, Ate, ya, yb in inner_sets:
+                        clf = make_svc(C, loss, seed).fit(Atr[:, cols], ya)
+                        accs.append(np.mean(clf.predict(Ate[:, cols]) == yb))
                     inner[k, i, j] = np.mean(accs)
 
         # ---- 2. select the voxel count -----------------------------------
@@ -753,8 +772,9 @@ def nested_fold_job(roi, test_group, data, pos_by_n, pair_list, params,
             j = pick_index(inner[k, i], "smallest")   # first in grid order
             C, loss = params[j]
             cols = pos_by_n[n]
-            clf = make_svc(C, loss, seed).fit(Xtr[:, cols], ytr)
-            acc = float(np.mean(clf.predict(Xte[:, cols]) == yte))
+            Atr, Ate = scale_split(Xtr, Xte, standardize)     # all training blocks -> held-out block
+            clf = make_svc(C, loss, seed).fit(Atr[:, cols], ytr)
+            acc = float(np.mean(clf.predict(Ate[:, cols]) == yte))
             rows.append({
                 "pair": k + 1, "A_label": a, "B_label": b, "ROI": roi,
                 "fold": int(test_group), "voxels": n,
@@ -821,7 +841,7 @@ def run_nested(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     results = Parallel(n_jobs=args.n_jobs, backend="loky", verbose=10)(
         delayed(nested_fold_job)(roi, tg, d, pos, pair_list, params,
                                  args.selection_scope, args.tie_break,
-                                 args.seed)
+                                 args.seed, args.standardize)
         for roi, tg, d, pos in jobs
     )
     errors = [e for *_, e in results if e is not None]
@@ -837,6 +857,8 @@ def run_nested(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     tag = f"nested-{args.selection_scope}"
     if args.fixed_c is not None:
         tag += f"_C{args.fixed_c:g}"
+    if args.standardize != "none":
+        tag += "_zscore"
     out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase_tag}_{tag}_{today}.xlsx"
 
     # Safety net: save the raw fold table before aggregating.
