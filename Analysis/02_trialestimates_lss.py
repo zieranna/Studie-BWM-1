@@ -201,6 +201,7 @@ def parse_args() -> argparse.Namespace:
                    help="Fit the raw signal. Default: signal_scaling=0, i.e. each "
                         "voxel's time series is divided by its mean, so betas are "
                         "in percent signal change.")
+
     p.add_argument("--windows", choices=["all", "main"], default="all",
                    help="--basis fir only. 'all' (default): main windows plus "
                         "every specification-curve window in FIR_WINDOWS. "

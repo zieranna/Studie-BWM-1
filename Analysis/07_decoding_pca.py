@@ -46,6 +46,18 @@ nested (revision, Reviewer 2 comment 1a)
     Note: the top-N voxel RANKING (07_create_top_voxel_rois.py) still
     uses all runs. It is label-blind (Reviewer 2, minor comment 2).
 
+allcounts (specification curve over voxel counts)
+    Accuracy for EVERY candidate voxel count separately, no selection: the
+    nested engine (refit LinearSVC on all training blocks) with C fixed
+    (--fixed-c) or tuned per count in an inner LOGO. Output like the fixed
+    mode (per_pair / summary per ROI x voxels), tag allcounts[_C<c>].
+
+mask (Rademaker et al., 2019)
+    All voxels of one mask per ROI from --mask-dir (sub-XX/<ROI>.nii.gz),
+    e.g. localizer-responsive voxels (07_create_responsive_rois.py): no
+    voxel count, no PCA. C fixed (--fixed-c) or tuned in an inner LOGO.
+    ROIs below --min-voxels (default 20) are skipped. Tag mask-<folder>.
+
 pca (alternative without voxel selection)
     Every voxel of the whole ROI is used. In each split the PCA is fitted
     on the TRAINING blocks only (--pca-fit analysis: all labels of the
@@ -55,6 +67,9 @@ pca (alternative without voxel selection)
     in nested mode (same --selection-scope, --tie-break, C grid).
     Whole-ROI masks: --pca-roi-dir (flat folder such as roi_anat:
     sub-XX/<ROI>_resampled.nii.gz if on the map grid, else <ROI>.nii.gz).
+    Candidates (--n-components) are variance fractions by default (fewest
+    components explaining >= x of the training variance, recomputed in every
+    PCA fit), optionally fixed numbers; tag pcavar-... with fractions.
     Candidate 'all' keeps every component, which is equivalent to a
     linear SVM on all ROI voxels (up to liblinear's penalized intercept),
     so "no reduction" is always among the candidates. Output as in nested
@@ -271,13 +286,22 @@ def parse_args() -> argparse.Namespace:
                    help="Restrict to these ROIs (default: all).")
 
     # ---- voxel selection -------------------------------------------------
-    p.add_argument("--voxel-selection", choices=["fixed", "nested", "pca"],
+    p.add_argument("--voxel-selection", choices=["fixed", "nested", "allcounts", "pca", "mask"],
                    default="fixed",
                    help="'fixed' (default): one accuracy per voxel count, "
                         "original pipeline. 'nested': voxel count chosen "
                         "inside each training fold (Reviewer 2, comment 1a). "
                         "'pca': whole ROI, PCA fitted on the training blocks, "
-                        "number of components chosen inside each training fold.")
+                        "number of components chosen inside each training fold. "
+                        "'allcounts': accuracy for EVERY voxel count, no selection "
+                        "(nested engine; C fixed with --fixed-c or tuned per count). "
+                        "'mask': all voxels of one mask per ROI (--mask-dir), e.g. "
+                        "localizer-responsive voxels after Rademaker et al. (2019).")
+    p.add_argument("--mask-dir", type=Path, default=None,
+                   help="mask only. Flat folder <dir>/sub-XX/<ROI>.nii.gz, e.g. the "
+                        "output of 07_create_responsive_rois.py.")
+    p.add_argument("--min-voxels", type=int, default=20,
+                   help="mask only. Skip ROIs with fewer voxels (Rademaker et al.: 20).")
     p.add_argument("--selection-scope", choices=["pooled", "per_pair"],
                    default="pooled",
                    help="nested only. 'pooled' (default): one voxel count per "
@@ -295,10 +319,15 @@ def parse_args() -> argparse.Namespace:
                    help="nested only. Candidate voxel counts for every ROI "
                         "(overrides ROI_VOXELS). A single value gives a "
                         "fixed-count run with the nested engine.")
-    p.add_argument("--n-components", nargs="+", default=["2", "5", "10", "20", "50", "all"],
-                   help="pca only. Candidate numbers of PCA components, chosen "
-                        "inside each training fold like the voxel count; 'all' "
-                        "= no reduction (equivalent to all ROI voxels).")
+    p.add_argument("--n-components", nargs="+",
+                   default=["0.5", "0.7", "0.8", "0.9", "0.95", "0.99", "all"],
+                   help="pca only. Candidates, chosen inside each training fold like "
+                        "the voxel count: variance fractions ('0.9' or '90%%' = fewest "
+                        "components explaining >= 90 %% of the training variance, "
+                        "recomputed for every PCA fit), fixed numbers ('20'), and "
+                        "'all' (no reduction, equivalent to all ROI voxels). "
+                        "Default: 0.5 0.7 0.8 0.9 0.95 0.99 all. Runs with variance "
+                        "fractions are named pcavar-..., others pca-...")
     p.add_argument("--pca-fit", choices=["analysis", "pair"], default="analysis",
                    help="pca only. Maps the PCA is fitted on (training blocks only): "
                         "'analysis' (default) = all labels of the analysis (more maps, "
@@ -830,12 +859,16 @@ def nested_fold_job(roi, test_group, data, pos_by_n, pair_list, params,
         return [], [], f"{roi} fold {test_group}: {e}"
 
 
-def write_nested_outputs(args, folds, curve, tag, out_dir, today, unit="voxels"):
+def write_nested_outputs(args, folds, curve, tag, out_dir, today, unit="voxels",
+                         label=None):
     """Aggregate the fold table and write the workbook (nested and PCA modes).
 
-    In PCA mode the 'voxels' columns hold the number of PCA components
-    (unit = 'components'), so downstream scripts read both modes alike.
+    In PCA mode the numbers are PCA components, not voxels. The written
+    columns are named accordingly (n_components_*, roi_voxels,
+    variance_explained); only 'voxels' in the sheet voxel_choice keeps its
+    name (read by the group-statistics script), with unit = 'components'.
     """
+    pca = unit == "components"
     out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase_tag}_{tag}_{today}.xlsx"
 
     # Safety net: save the raw fold table before aggregating.
@@ -862,7 +895,8 @@ def write_nested_outputs(args, folds, curve, tag, out_dir, today, unit="voxels")
                             std_accuracy=("accuracy", "std"),
                             n_pairs=("accuracy", "size"))
                        .reset_index())
-    summary.insert(1, "voxels", "nested" if unit == "voxels" else "pca")
+    label = label or ("nested" if unit == "voxels" else "pca")
+    summary.insert(1, "voxels", label)
     summary[["mean_accuracy", "std_accuracy"]] = \
         summary[["mean_accuracy", "std_accuracy"]].round(4)
 
@@ -879,13 +913,27 @@ def write_nested_outputs(args, folds, curve, tag, out_dir, today, unit="voxels")
                         .reset_index().round(4))
     inner_curve["unit"] = unit
 
-    label = "voxel counts" if unit == "voxels" else "numbers of PCA components"
+    what = "voxel counts" if unit == "voxels" else "numbers of PCA components"
     print("\n" + "-" * 64)
-    print(f"{'Nested' if unit == 'voxels' else 'PCA'} decoding: mean accuracy across pairs (per ROI):")
+    print(f"{label} decoding: mean accuracy across pairs (per ROI):")
     print("-" * 64)
     print(summary.to_string(index=False))
-    print(f"\nSelected {label} (share of folds):")
+    print(f"\nSelected {what} (share of folds):")
     print(choice.to_string(index=False))
+
+    if pca:
+        # name the columns after what they hold (PCA components, not voxels)
+        extra = (folds.groupby(["pair", "ROI"], sort=False)
+                      .agg(roi_voxels=("roi_voxels", "first"),
+                           median_variance_explained=("variance_explained", "median"))
+                      .reset_index())
+        per_pair = (per_pair.rename(columns={"median_voxels": "median_n_components",
+                                             "modal_voxels": "modal_n_components"})
+                            .merge(extra, on=["pair", "ROI"], how="left"))
+        summary = summary.rename(columns={"voxels": "selection"})
+        folds = folds.rename(columns={"voxels": "n_components_used",
+                                      "n_components": "chosen_fraction"})
+        inner_curve = inner_curve.rename(columns={"voxels": "candidate"})
 
     with pd.ExcelWriter(out_xlsx) as xl:
         per_pair.to_excel(xl, sheet_name="per_pair", index=False)
@@ -1001,15 +1049,43 @@ def whole_roi_path(roi_dir: Path, sub: str, roi: str, roi_file, voxel_list):
 
 
 def parse_components(tokens) -> list:
-    """['2', '5', 'all'] -> [2, 5, None]; None = all components (no reduction)."""
-    ints = sorted({int(t) for t in tokens if str(t).lower() != "all"})
+    """Candidates for the number of PCA components.
+
+    '0.9' or '90%'  -> ('var', 0.9): fewest components explaining >= 90 % of the
+                       training variance (recomputed for every PCA fit)
+    '20'            -> ('n', 20): a fixed number of components
+    'all'           -> None: every component (no reduction)
+    Order (relevant for --tie-break): variance fractions ascending, then fixed
+    numbers ascending, then 'all'.
+    """
+    fracs, ints, has_all = set(), set(), False
+    for t in map(str, tokens):
+        t = t.strip().lower()
+        if t == "all":
+            has_all = True
+        elif t.endswith("%"):
+            fracs.add(float(t[:-1]) / 100)
+        elif "." in t:
+            fracs.add(float(t))
+        else:
+            ints.add(int(t))
+    if any(not 0 < f < 1 for f in fracs):
+        raise ValueError("variance fractions must lie between 0 and 1 (or 0 % and 100 %)")
     if any(i < 1 for i in ints):
-        raise ValueError("--n-components must be >= 1 or 'all'")
-    return ints + ([None] if any(str(t).lower() == "all" for t in tokens) else [])
+        raise ValueError("numbers of components must be >= 1")
+    return ([("var", f) for f in sorted(fracs)] + [("n", i) for i in sorted(ints)]
+            + ([None] if has_all else []))
+
+
+def comp_label(c) -> str:
+    if c is None:
+        return "all"
+    kind, v = c
+    return f"{v * 100:g}%" if kind == "var" else str(v)
 
 
 def pca_fit(X: np.ndarray, standardize: str):
-    """PCA model fitted on X (rows = maps): (mu, sd, mean, components).
+    """PCA model fitted on X (rows = maps): (mu, sd, mean, components, cumvar).
 
     Optional z-scoring per voxel first (training statistics only), then
     centering and SVD. Components with a singular value of ~0 are dropped,
@@ -1027,11 +1103,14 @@ def pca_fit(X: np.ndarray, standardize: str):
     _, S, Vt = np.linalg.svd(Xc, full_matrices=False)
     # rank tolerance as in numpy.linalg.matrix_rank
     tol = S.max() * max(Xc.shape) * np.finfo(np.float32).eps if S.size else np.inf
-    return mu, sd, m, Vt[S > tol]
+    keep = S > tol
+    var = S[keep] ** 2
+    cumvar = np.cumsum(var) / var.sum() if var.size else np.zeros(0)
+    return mu, sd, m, Vt[keep], cumvar
 
 
 def pca_project(model, X: np.ndarray) -> np.ndarray:
-    mu, sd, m, Vt = model
+    mu, sd, m, Vt, _ = model
     return ((X - mu) / sd - m) @ Vt.T
 
 
@@ -1053,7 +1132,7 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
         blocks = np.unique(np.concatenate([g for _, g in data.values()]))
         inner_blocks = [int(h) for h in blocks if h != test_group]
 
-        proj, kmax = {}, {}
+        proj, kmax, cumv = {}, {}, {}
         if fit_on == "analysis":
             for key, excl in [("outer", [test_group])] + \
                              [(h, [test_group, h]) for h in inner_blocks]:
@@ -1061,16 +1140,23 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
                 mdl = pca_fit(fit_X, standardize)
                 proj[key] = {lab: pca_project(mdl, X) for lab, (X, _) in data.items()}
                 kmax[key] = mdl[3].shape[0]
+                cumv[key] = mdl[4]
 
         def project_pair(key, a, b, X, tr):
-            """Component scores of the pair's maps for one split, and k max."""
+            """Component scores of the pair's maps for one split, k max and
+            cumulative explained variance of that PCA fit."""
             if fit_on == "analysis":
-                return np.vstack([proj[key][a], proj[key][b]]), kmax[key]
+                return np.vstack([proj[key][a], proj[key][b]]), kmax[key], cumv[key]
             mdl = pca_fit(X[tr], standardize)
-            return pca_project(mdl, X), mdl[3].shape[0]
+            return pca_project(mdl, X), mdl[3].shape[0], mdl[4]
 
-        def n_comp(c, km):
-            return km if c is None else min(c, km)
+        def n_comp(c, km, cv):
+            if c is None:
+                return km
+            kind, v = c
+            if kind == "n":
+                return min(v, km)
+            return int(min(np.searchsorted(cv, v - 1e-12) + 1, km))  # fewest comps with >= v
 
         # ---- 1. inner LOGO over the training blocks ------------------------
         splits = [None] * n_sets
@@ -1089,9 +1175,9 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
                 te = g == h
                 if not te.any() or len(np.unique(y[tr])) < 2:
                     continue
-                Z, km = project_pair(h, a, b, X, tr)
+                Z, km, cv = project_pair(h, a, b, X, tr)
                 for i, c in enumerate(cands):
-                    kk = n_comp(c, km)
+                    kk = n_comp(c, km, cv)
                     for j, (C, loss) in enumerate(params):
                         clf = make_svc(C, loss, seed).fit(Z[tr][:, :kk], y[tr])
                         acc[i, j] += np.mean(clf.predict(Z[te][:, :kk]) == y[te])
@@ -1115,9 +1201,9 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
                 continue
             a, b, X, y, g = splits[k]
             tr, te = g != test_group, g == test_group
-            Z, km = project_pair("outer", a, b, X, tr)
+            Z, km, cv = project_pair("outer", a, b, X, tr)
             i = i_sel[k]
-            kk = n_comp(cands[i], km)
+            kk = n_comp(cands[i], km, cv)
             j = pick_index(inner[k, i], "smallest")
             C, loss = params[j]
             clf = make_svc(C, loss, seed).fit(Z[tr][:, :kk], y[tr])
@@ -1125,8 +1211,9 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
                 "pair": k + 1, "A_label": a, "B_label": b, "ROI": roi,
                 "fold": int(test_group),
                 "voxels": int(kk),                      # = number of components used
-                "n_components": "all" if cands[i] is None else cands[i],
+                "n_components": comp_label(cands[i]),
                 "components_max": int(km), "roi_voxels": int(X.shape[1]),
+                "variance_explained": round(float(cv[kk - 1]), 4) if kk else np.nan,
                 "C": C, "loss": loss,
                 "inner_accuracy": float(inner[k, i, j]),
                 "test_accuracy": float(np.mean(clf.predict(Z[te][:, :kk]) == y[te])),
@@ -1134,7 +1221,7 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
             for i2, c2 in enumerate(cands):
                 curve.append({
                     "pair": k + 1, "ROI": roi, "fold": int(test_group),
-                    "voxels": "all" if c2 is None else str(c2),
+                    "voxels": comp_label(c2),
                     "inner_accuracy": float(best_over_params[k, i2]),
                 })
         return rows, curve, None
@@ -1142,24 +1229,25 @@ def pca_fold_job(roi, test_group, data, pair_list, params, cands, scope,
         return [], [], f"{roi} fold {test_group}: {e}"
 
 
-def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
-    """Whole ROI, PCA fitted on training blocks, number of components nested."""
-    cands = parse_components(args.n_components)
-    if args.fixed_c is None:
-        params = [(C, loss) for C in C_GRID for loss in LOSS_GRID]
-    else:
-        params = [(args.fixed_c, "squared_hinge")]
+def load_flat_masks(args, roi_voxels, ref_path, flat_dir, roi_file=None,
+                    min_voxels=0) -> dict:
+    """{roi: flat voxel indices on the map grid} for one mask per ROI.
 
+    flat_dir given: masks in <flat_dir>/sub-XX/ (e.g. roi_anat, roi_responsive);
+    a mask on the map grid is used as it is, otherwise it is resampled in
+    memory. flat_dir None: <roi-dir>/sub-XX/<ROI>/ (PCA fallback). ROIs with
+    fewer than min_voxels voxels are skipped.
+    """
     ref = nib.load(str(ref_path))
     print("Loading whole-ROI masks ...")
     roi_cols = {}
     for roi, voxel_list in roi_voxels.items():
         rs = None
-        if args.pca_roi_dir:
+        if flat_dir:
             # flat folder (roi_anat): a mask already on the map grid is used
             # as it is; otherwise the unresampled mask is resampled here
-            for cand in whole_roi_candidates(args.pca_roi_dir, args.subject, roi,
-                                             args.pca_roi_file):
+            for cand in whole_roi_candidates(flat_dir, args.subject, roi,
+                                             roi_file):
                 img = nib.load(str(cand))
                 if _on_grid(img, ref):
                     rs, p, note = img, cand, "whole ROI, already on the map grid"
@@ -1175,11 +1263,11 @@ def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
                 print(f"  [info] {roi}: {cand.name} is on another grid; trying the next mask")
             if rs is None:
                 print(f"  [warn] {roi}: no usable whole-ROI mask in "
-                      f"{Path(args.pca_roi_dir) / f'sub-{args.subject}'}")
+                      f"{Path(flat_dir) / f'sub-{args.subject}'}")
                 continue
         else:
             p, note = whole_roi_path(args.roi_dir, args.subject, roi,
-                                     args.pca_roi_file, voxel_list)
+                                     roi_file, voxel_list)
             if p is None:
                 print(f"  [warn] {roi}: {note}")
                 continue
@@ -1190,6 +1278,23 @@ def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
         idx = np.flatnonzero(np.asanyarray(rs.dataobj).reshape(-1) > 0)
         print(f"  {roi:>13}: {idx.size} voxels from {p.name} ({note})")
         roi_cols[roi] = idx
+        if idx.size < min_voxels:
+            print(f"  [skip] {roi}: {idx.size} voxels < --min-voxels {min_voxels}")
+            del roi_cols[roi]
+    return roi_cols
+
+
+def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
+    """Whole ROI, PCA fitted on training blocks, number of components nested."""
+    cands = parse_components(args.n_components)
+    if args.fixed_c is None:
+        params = [(C, loss) for C in C_GRID for loss in LOSS_GRID]
+    else:
+        params = [(args.fixed_c, "squared_hinge")]
+
+    ref = nib.load(str(ref_path))
+    roi_cols = load_flat_masks(args, roi_voxels, ref_path, args.pca_roi_dir,
+                               args.pca_roi_file)
     if not roi_cols:
         raise FileNotFoundError("No ROI masks found. Check --roi-dir / --pca-roi-file.")
 
@@ -1211,7 +1316,7 @@ def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
 
     print(f"\nRunning {len(jobs)} ROI x fold jobs on {args.n_jobs} workers ...")
     print(f"  PCA fitted on: {args.pca_fit} (training blocks only); components "
-          f"{['all' if c is None else c for c in cands]}; scope={args.selection_scope}, "
+          f"{[comp_label(c) for c in cands]}; scope={args.selection_scope}, "
           f"tie-break={args.tie_break}, C={'tuned' if args.fixed_c is None else args.fixed_c}, "
           f"standardize={args.standardize}")
     t0 = time.time()
@@ -1231,13 +1336,229 @@ def run_pca(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
     if folds.empty:
         raise RuntimeError("No results. See errors above.")
 
-    tag = f"pca-{args.pca_fit}-{args.selection_scope}"
+    use_var = any(c is not None and c[0] == "var" for c in cands)
+    tag = f"{'pcavar' if use_var else 'pca'}-{args.pca_fit}-{args.selection_scope}"
     if args.fixed_c is not None:
         tag += f"_C{args.fixed_c:g}"
     if args.standardize != "none":
         tag += "_zscore"
     return write_nested_outputs(args, folds, curve, tag, out_dir, today,
                                 unit="components")
+
+
+# ============================================================================
+# ALLCOUNTS mode: one accuracy for EVERY candidate voxel count (no selection)
+# ============================================================================
+def allcounts_fold_job(roi, test_group, data, pos_by_n, pair_list, params, seed,
+                       standardize="none"):
+    """One ROI x one held-out block: an SVM per voxel count (top-N masks), each
+    tested on the held-out block. C/loss tuned per count in an inner LOGO over
+    the training blocks only if more than one setting is given."""
+    warnings.filterwarnings("ignore")
+    try:
+        rows = []
+        for k, (a, b) in enumerate(pair_list):
+            (XA, gA), (XB, gB) = data[a], data[b]
+            X = np.vstack([XA, XB])
+            y = np.r_[np.zeros(len(gA), int), np.ones(len(gB), int)]
+            g = np.r_[gA, gB]
+            te = g == test_group
+            if not te.any():
+                continue
+            tr = ~te
+            inner_sets = []
+            if len(params) > 1:
+                inner_sets = [scale_split(X[tr][itr], X[tr][ite], standardize)
+                              + (y[tr][itr], y[tr][ite])
+                              for itr, ite in LeaveOneGroupOut().split(X[tr], y[tr], g[tr])]
+            Atr, Ate = scale_split(X[tr], X[te], standardize)
+            for n in sorted(pos_by_n):
+                cols = pos_by_n[n]
+                j, inner = 0, np.nan
+                if inner_sets:
+                    acc = np.zeros(len(params))
+                    for Itr, Ite, ya, yb in inner_sets:
+                        for jj, (C, loss) in enumerate(params):
+                            clf = make_svc(C, loss, seed).fit(Itr[:, cols], ya)
+                            acc[jj] += np.mean(clf.predict(Ite[:, cols]) == yb)
+                    acc /= len(inner_sets)
+                    j = pick_index(acc, "smallest")
+                    inner = float(acc[j])
+                C, loss = params[j]
+                clf = make_svc(C, loss, seed).fit(Atr[:, cols], y[tr])
+                rows.append({
+                    "pair": k + 1, "A_label": a, "B_label": b, "ROI": roi,
+                    "fold": int(test_group), "voxels": int(n),
+                    "voxels_actual": int(len(cols)), "C": C, "loss": loss,
+                    "inner_accuracy": inner,
+                    "test_accuracy": float(np.mean(clf.predict(Ate[:, cols]) == y[te])),
+                })
+        return rows, [], None
+    except Exception as e:
+        return [], [], f"{roi} fold {test_group}: {e}"
+
+
+def run_allcounts(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
+    """Accuracy for every candidate voxel count separately (specification curve
+    over voxel counts), with the nested engine (refit LinearSVC, C fixed or
+    tuned per count). Output in the format of the fixed mode."""
+    if args.voxel_counts:
+        roi_voxels = {r: sorted(set(args.voxel_counts)) for r in roi_voxels}
+    params = ([(args.fixed_c, "squared_hinge")] if args.fixed_c is not None
+              else [(C, loss) for C in C_GRID for loss in LOSS_GRID])
+    print("Loading ROI masks ...")
+    roi_idx = load_roi_indices(args.roi_dir, args.subject, roi_voxels, ref_path)
+    if not roi_idx:
+        raise FileNotFoundError("No ROI masks found. Check --roi-dir.")
+    all_idx = np.unique(np.concatenate([v for d in roi_idx.values() for v in d.values()]))
+    labels = list(dict.fromkeys(lab for pair in pair_list for lab in pair))
+    print(f"Loading maps for {len(labels)} labels ({all_idx.size} voxels in the ROI union) ...")
+    data_all = load_patterns(args.tmap_dir, args.subject, args.phase, kind, labels,
+                             all_idx, nib.load(str(ref_path)), args.trial_subdir)
+    groups = np.unique(np.concatenate([g for _, g in data_all.values()]))
+    jobs = []
+    for roi, idx in roi_idx.items():
+        roi_union = np.unique(np.concatenate(list(idx.values())))
+        cols = np.searchsorted(all_idx, roi_union)
+        pos_by_n = {n: np.searchsorted(roi_union, v) for n, v in idx.items()}
+        data_roi = {lab: (X[:, cols], g) for lab, (X, g) in data_all.items()}
+        for test_group in groups:
+            jobs.append((roi, int(test_group), data_roi, pos_by_n))
+    print(f"\nRunning {len(jobs)} ROI x fold jobs on {args.n_jobs} workers "
+          f"(every voxel count; C={'tuned per count' if args.fixed_c is None else args.fixed_c}) ...")
+    t0 = time.time()
+    results = Parallel(n_jobs=args.n_jobs, backend="loky", verbose=10)(
+        delayed(allcounts_fold_job)(roi, tg, d, pos, pair_list, params, args.seed,
+                                    args.standardize)
+        for roi, tg, d, pos in jobs)
+    errors = [e for *_, e in results if e is not None]
+    for e in errors:
+        print(f"  [error] {e}")
+    folds = pd.DataFrame([r for rows, _, _ in results for r in rows])
+    print(f"\nFinished {len(jobs) - len(errors)}/{len(jobs)} jobs in {time.time() - t0:.1f}s.")
+    if folds.empty:
+        raise RuntimeError("No results. See errors above.")
+
+    tag = "allcounts" + (f"_C{args.fixed_c:g}" if args.fixed_c is not None else "") \
+        + ("_zscore" if args.standardize != "none" else "")
+    out_xlsx = out_dir / f"decoding_{args.analysis}_{args.phase_tag}_{tag}_{today}.xlsx"
+    folds.to_excel(out_xlsx, sheet_name="folds", index=False)          # safety net
+    per_pair = (folds.groupby(["pair", "A_label", "B_label", "ROI", "voxels"], sort=False)
+                     .agg(accuracy=("test_accuracy", "mean"), n_folds=("fold", "size"))
+                     .reset_index())
+    for i, (k, v) in enumerate({"subject": args.subject, "phase": args.phase,
+                                "analysis": args.analysis, "selection": tag}.items()):
+        per_pair.insert(i, k, v)
+    summary = (per_pair.groupby(["ROI", "voxels"], sort=False)
+                       .agg(mean_accuracy=("accuracy", "mean"),
+                            std_accuracy=("accuracy", "std"), n_pairs=("accuracy", "size"))
+                       .reset_index().round(4))
+    print("\n" + "-" * 64 + "\nMean accuracy across pairs (per ROI x voxel count):\n" + "-" * 64)
+    print(summary.to_string(index=False))
+    with pd.ExcelWriter(out_xlsx) as xl:
+        per_pair.to_excel(xl, sheet_name="per_pair", index=False)
+        summary.to_excel(xl, sheet_name="summary", index=False)
+        folds.to_excel(xl, sheet_name="folds", index=False)
+    print(f"Saved {out_xlsx}")
+    return f"decoding_script_{args.analysis}_{args.phase_tag}_{tag}_{today}.py"
+
+
+# ============================================================================
+# MASK mode: all voxels of a given mask per ROI (e.g. localizer-responsive
+# voxels after Rademaker et al., 2019) -- no selection, no PCA
+# ============================================================================
+def mask_fold_job(roi, test_group, data, pair_list, params, seed, standardize="none"):
+    """One ROI x one held-out block: SVM on all mask voxels. C/loss are tuned
+    in an inner LOGO over the training blocks only if more than one setting
+    is given (--fixed-c gives one)."""
+    warnings.filterwarnings("ignore")
+    try:
+        rows, curve = [], []
+        for k, (a, b) in enumerate(pair_list):
+            (XA, gA), (XB, gB) = data[a], data[b]
+            X = np.vstack([XA, XB])
+            y = np.r_[np.zeros(len(gA), int), np.ones(len(gB), int)]
+            g = np.r_[gA, gB]
+            te = g == test_group
+            if not te.any():
+                continue
+            tr = ~te
+            inner_acc = np.full(len(params), np.nan)
+            if len(params) > 1:
+                acc = np.zeros(len(params))
+                n_in = 0
+                for itr, ite in LeaveOneGroupOut().split(X[tr], y[tr], g[tr]):
+                    Atr, Ate = scale_split(X[tr][itr], X[tr][ite], standardize)
+                    for j, (C, loss) in enumerate(params):
+                        clf = make_svc(C, loss, seed).fit(Atr, y[tr][itr])
+                        acc[j] += np.mean(clf.predict(Ate) == y[tr][ite])
+                    n_in += 1
+                inner_acc = acc / n_in
+                j = pick_index(inner_acc, "smallest")
+            else:
+                j = 0
+            C, loss = params[j]
+            Atr, Ate = scale_split(X[tr], X[te], standardize)
+            clf = make_svc(C, loss, seed).fit(Atr, y[tr])
+            rows.append({
+                "pair": k + 1, "A_label": a, "B_label": b, "ROI": roi,
+                "fold": int(test_group), "voxels": int(X.shape[1]),
+                "C": C, "loss": loss, "inner_accuracy": float(inner_acc[j]),
+                "test_accuracy": float(np.mean(clf.predict(Ate) == y[te])),
+            })
+            curve.append({"pair": k + 1, "ROI": roi, "fold": int(test_group),
+                          "voxels": int(X.shape[1]),
+                          "inner_accuracy": float(inner_acc[j])})
+        return rows, curve, None
+    except Exception as e:
+        return [], [], f"{roi} fold {test_group}: {e}"
+
+
+def run_mask(args, kind, pair_list, roi_voxels, ref_path, out_dir, today):
+    """All voxels of one mask per ROI (--mask-dir), no voxel selection."""
+    if args.mask_dir is None:
+        raise SystemExit("--voxel-selection mask needs --mask-dir")
+    params = ([(args.fixed_c, "squared_hinge")] if args.fixed_c is not None
+              else [(C, loss) for C in C_GRID for loss in LOSS_GRID])
+    roi_cols = load_flat_masks(args, roi_voxels, ref_path, args.mask_dir,
+                               args.pca_roi_file, min_voxels=args.min_voxels)
+    if not roi_cols:
+        raise FileNotFoundError(f"No usable ROI masks in {args.mask_dir}.")
+
+    all_idx = np.unique(np.concatenate(list(roi_cols.values())))
+    labels = list(dict.fromkeys(lab for pair in pair_list for lab in pair))
+    print(f"Loading maps for {len(labels)} labels ({all_idx.size} voxels in the ROI union) ...")
+    data_all = load_patterns(args.tmap_dir, args.subject, args.phase, kind,
+                             labels, all_idx, nib.load(str(ref_path)), args.trial_subdir)
+    groups = np.unique(np.concatenate([g for _, g in data_all.values()]))
+
+    jobs = []
+    for roi, idx in roi_cols.items():
+        cols = np.searchsorted(all_idx, idx)
+        data_roi = {lab: (X[:, cols], g) for lab, (X, g) in data_all.items()}
+        for test_group in groups:
+            jobs.append((roi, int(test_group), data_roi))
+    print(f"\nRunning {len(jobs)} ROI x fold jobs on {args.n_jobs} workers "
+          f"(masks from {args.mask_dir}; C={'tuned' if args.fixed_c is None else args.fixed_c}, "
+          f"standardize={args.standardize}) ...")
+    t0 = time.time()
+    results = Parallel(n_jobs=args.n_jobs, backend="loky", verbose=10)(
+        delayed(mask_fold_job)(roi, tg, d, pair_list, params, args.seed, args.standardize)
+        for roi, tg, d in jobs)
+    errors = [e for *_, e in results if e is not None]
+    for e in errors:
+        print(f"  [error] {e}")
+    folds = pd.DataFrame([r for rows, _, _ in results for r in rows])
+    curve = pd.DataFrame([c for _, cs, _ in results for c in cs])
+    print(f"\nFinished {len(jobs) - len(errors)}/{len(jobs)} jobs in {time.time() - t0:.1f}s.")
+    if folds.empty:
+        raise RuntimeError("No results. See errors above.")
+    tag = f"mask-{Path(args.mask_dir).name}"
+    if args.fixed_c is not None:
+        tag += f"_C{args.fixed_c:g}"
+    if args.standardize != "none":
+        tag += "_zscore"
+    return write_nested_outputs(args, folds, curve, tag, out_dir, today, label="mask")
 
 
 # ============================================================================
@@ -1284,6 +1605,12 @@ def main() -> None:
     if args.voxel_selection == "nested":
         snapshot_name = run_nested(args, kind, pair_list, roi_voxels,
                                    ref_path, out_dir, today)
+    elif args.voxel_selection == "allcounts":
+        snapshot_name = run_allcounts(args, kind, pair_list, roi_voxels,
+                                      ref_path, out_dir, today)
+    elif args.voxel_selection == "mask":
+        snapshot_name = run_mask(args, kind, pair_list, roi_voxels,
+                                 ref_path, out_dir, today)
     elif args.voxel_selection == "pca":
         snapshot_name = run_pca(args, kind, pair_list, roi_voxels,
                                 ref_path, out_dir, today)
