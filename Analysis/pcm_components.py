@@ -26,12 +26,13 @@ second moment (G) of one subspace (component model, paper eq. 4):
     - / 10           (not modeled)   remaining set-specific order variance
 
 Analysis, following the paper:
-  * Data: one delay-period FIR t-map per trial (tmap_z), all ROI voxels.
-  * Fixed effects: one intercept per imaging run (section 2.3). Runs are
-    recovered from the run-wise z-scoring of the t-maps (infer_runs).
-  * Voxel independence: multivariate noise normalization (section 2.1;
-    Walther et al., 2016) with the spatial noise correlation estimated from
-    the GLM residual time series (shrinkage, true residual df).
+  * Data: one delay-period map per trial, all ROI voxels: FIR t-maps
+    (layout=fir) or LSS single-trial betas (layout=lss).
+  * Fixed effects: one intercept per imaging run (section 2.3). LSS: run
+    from the file names; FIR: recovered from the run-wise z-scoring.
+  * Voxel independence: noise normalization (section 2.1; Walther et al.,
+    2016): per-voxel noise SD, plus the spatial noise correlation from the
+    FIR GLM residual time series when available (shrinkage, true residual df).
   * Model evidence: every combination of components (model family), fitted
     with leave-one-participant-out group cross-validation (sections 2.7.2,
     3.1). Individual AIC fits are a quick check only.
@@ -46,15 +47,30 @@ Analysis, following the paper:
     cross-validated G instead of a free model (see noise_ceiling).
   * Binding null: block-wise random swaps of binding configurations.
 
-Usage:
-  python pcm_binding.py simulate              # recovery check on simulated data
-  python pcm_binding.py real                  # quick check (AIC, no null)
-  python pcm_binding.py real cv ceiling null=100   # analysis for the paper
-  add "only18" to skip the 36-condition analysis (much faster with cv)
-  add "nowhiten" to skip prewhitening, "whiten=maps" to estimate the noise
-  from the t-maps instead of the residuals
+Usage (arguments in any order):
+  python pcm_binding.py simulate                 recovery check on simulated data
+  python pcm_binding.py real                     cv variances + AIC model family
+  python pcm_binding.py real cv ceiling null=100 analysis for the paper
+Options:
+  layout=fir|lss        input maps (default fir = FIR t-maps, tmap_z)
+  estimate=hrf/beta/del LSS estimate folder <model>/<stat>/<window>
+  base=<dir>            folder with roi_anat/, roi_func/ (and firestimates/)
+  lss=<dir>             LSS root (default <base>/lss)
+  roi=anat/V1,func/early_visual/top0700,...   ROIs, each analysed in turn
+  out=<dir>             output folder (default: current folder)
+  cv                    group cross-validation for 18 conditions (36: AIC)
+  cv36                  group cross-validation for 36 conditions too (slow)
+  ceiling               noise ceiling (with cv)
+  null=N                N binding-null permutations
+  only18                skip the 36-condition analysis
+  jobs=N, loadjobs=M    processes for fits/permutations and for loading
+  whiten=residuals|auto|univariate|maps|none
+                        default: residuals for fir, auto for lss
+  resid=<template>      FIR GLM residual files, {sub:02d} = participant
+  resid_offset=1        residual folder number = participant number + offset
+  subs=01,02,...        participants (default: every sub-* folder)
 
-Requires: pip install PcmPy numpy scipy scikit-learn nibabel pandas matplotlib
+Requires: pip install PcmPy numpy scipy scikit-learn nibabel nilearn pandas matplotlib
 (works with pandas 2 and 3; see crossval_table)
 """
 
@@ -202,18 +218,35 @@ def check_design(with_order=True):
 # ----------------------------------------------------------------------------
 # 3. Your files and trial types
 # ----------------------------------------------------------------------------
-BASE = '/home/annaz/BindingWM/Studie-BWM-1/bindingWM'
-FIR = BASE + '/firestimates/sub-{sub:02d}/model/fir/binding/{kind}/del'
+# Local defaults. On the cluster, run_pcm_lss.sh passes base=, lss=, out= etc.
+BASE = '/home/annaz/BindingWM/Studie-BWM-1/bindingWM'   # firestimates/, roi_func/, roi_anat/
+LSS_DIR = BASE + '/lss'          # sub-XX/<model>/<stat>/<window>/trials/
+LAYOUT = 'fir'                   # 'fir': FIR t-maps (tmap_z); 'lss': LSS single trials
+ESTIMATE = 'hrf/beta/del'        # LSS estimate folder: <model>/<stat>/<window>
 ROI = BASE + '/roi_func/sub-{sub:02d}/early_visual/top0700_resampled.nii.gz'
-# GLM residuals (time series) for prewhitening. These folders are numbered
-# 02-21; bindingWM/sub-01 corresponds to final/sub-02.
+# GLM residuals (time series) of the FIR model, for whiten=residuals. These
+# folders are numbered 02-21; bindingWM/sub-01 corresponds to final/sub-02.
 RESID = ('/home/annaz/BindingWM/Studie-BWM-1/final/sub-{sub:02d}/model/fir/BindingExp/'
          'firsticks/residuals_single/sub-{sub:02d}_ses-*_run-*_residuals.nii.gz')
 RESID_SUB_OFFSET = 1
 RUNS_PER_BLOCK = 2
-WHITEN = 'residuals'   # 'residuals' (paper / Walther et al.), 'maps' or None
 SUBJECTS = None   # list of the included participants, e.g. [1, 2, 4];
-                  # None = every sub-* folder in firestimates
+                  # None = every sub-* folder of the input
+
+
+def default_config(**kw):
+    """All settings a worker process needs, passed explicitly (so parallel
+    workers do not depend on module-level variables)."""
+    cfg = dict(layout=LAYOUT, base=BASE, lss_dir=LSS_DIR, estimate=ESTIMATE,
+               roi=ROI, resid=RESID, resid_offset=RESID_SUB_OFFSET,
+               kind='tmap_z', whiten=None)
+    cfg.update(kw)
+    if cfg['whiten'] is None:
+        cfg['whiten'] = 'residuals' if cfg['layout'] == 'fir' else 'auto'
+    if cfg['whiten'] == 'none':
+        cfg['whiten'] = None
+    return cfg
+
 
 # Only the structure matters (which trial types share a color or a direction),
 # not the names, so the direction-label question (R2.3c) does not affect PCM.
@@ -318,46 +351,90 @@ def check_trial_types():
 # ----------------------------------------------------------------------------
 # 4. Loading, run structure and prewhitening
 # ----------------------------------------------------------------------------
-def load_subject(sub, kind='tmap_z', roi=None):
-    """Delay-period FIR t-maps of one participant inside the ROI mask.
-    kind = 'tmap_z'    -> one map per trial type (1a ... 18b) and block
-           'tmap_pair' -> one map per pair (1 ... 18) and block
-    Returns Y (n_maps x n_voxels), the trial table (block_id = session x
-    block) and the mask of kept ROI voxels (voxels with NaN are dropped)."""
+def list_maps(sub, cfg):
+    """Trial table of one participant (one row per map file).
+    layout 'lss': <lss_dir>/sub-XX/<estimate>/trials/
+                  sub-XX_ses-YY_block-BB_run-NN_trial-<K><a|b>.nii.gz
+    layout 'fir': <base>/firestimates/sub-XX/model/fir/binding/<kind>/del/
+                  sub-XX_ses-YY_block-BB_trial-<K><a|b>.nii.gz (or pair-<K>)"""
     import glob, os, re
-    import nibabel as nib
-    folder = FIR.format(sub=sub, kind=kind)
-    pat = re.compile(r'ses-(\d+)_block-(\d+)_(?:pair|trial)-(\d+)([ab]?)\.nii(?:\.gz)?$')
+    if cfg['layout'] == 'lss':
+        folder = f"{cfg['lss_dir']}/sub-{sub:02d}/{cfg['estimate']}/trials"
+        pat = re.compile(r'ses-(\d+)_block-(\d+)_run-(\d+)_trial-(\d+)([ab])\.nii(?:\.gz)?$')
+    else:
+        folder = (f"{cfg['base']}/firestimates/sub-{sub:02d}/model/fir/binding/"
+                  f"{cfg['kind']}/del")
+        pat = re.compile(r'ses-(\d+)_block-(\d+)_(?:pair|trial)-(\d+)([ab]?)\.nii(?:\.gz)?$')
+    files = sorted(glob.glob(os.path.join(folder, '*.nii*')))
     rows = []
-    for f in sorted(glob.glob(os.path.join(folder, '*.nii*'))):
+    for f in files:
         m = pat.search(os.path.basename(f))
         if m is None:
             continue
-        num, ab = int(m[3]), m[4]
+        g = m.groups()
+        ses, block = int(g[0]), int(g[1])
+        run = int(g[2]) if cfg['layout'] == 'lss' else None
+        num, ab = int(g[-2]), g[-1]
         first, second = TRIAL_TYPES[num]
         if ab == 'b':
             first, second = second, first
-        rows.append(dict(file=f, ses=int(m[1]), block=int(m[2]), trial_type=f'{num}{ab}',
-                         color1=COLORS[first[0]], motion1=MOTIONS[first[1]],
-                         color2=COLORS[second[0]], motion2=MOTIONS[second[1]]))
+        row = dict(file=f, ses=ses, block=block, trial_type=f'{num}{ab}',
+                   color1=COLORS[first[0]], motion1=MOTIONS[first[1]],
+                   color2=COLORS[second[0]], motion2=MOTIONS[second[1]])
+        if run is not None:
+            row['run'] = ses * 100 + run
+        rows.append(row)
     if not rows:
-        raise FileNotFoundError(f'No t-maps found in {folder}')
+        example = os.path.basename(files[0]) if files else 'no .nii files at all'
+        raise FileNotFoundError(f'No maps with the expected names in {folder} '
+                                f'(found: {example})')
     trials = pd.DataFrame(rows)
     trials['block_id'] = trials.ses * 100 + trials.block
+    return trials
 
-    mask_img = nib.load((roi or ROI).format(sub=sub))
-    mask = np.nan_to_num(np.asarray(mask_img.dataobj).squeeze()) != 0
+
+def get_mask(sub, cfg, ref_img):
+    """ROI mask on the grid of the maps. cfg['roi'] may list several
+    candidate files separated by '|'; the first existing one is used. A mask
+    on another grid is resampled (nearest neighbour)."""
+    import os
+    import nibabel as nib
+    cands = [c.format(sub=sub) for c in cfg['roi'].split('|')]
+    path = next((c for c in cands if os.path.exists(c)), None)
+    if path is None:
+        raise FileNotFoundError(f'No ROI mask for sub-{sub:02d}: ' + ' | '.join(cands))
+    img = nib.load(path)
+    if img.shape[:3] != ref_img.shape[:3] or not np.allclose(img.affine, ref_img.affine, atol=1e-3):
+        from nilearn.image import resample_to_img
+        img = resample_to_img(img, ref_img.slicer[..., 0] if len(ref_img.shape) > 3 else ref_img,
+                              interpolation='nearest')
+        note = ' (resampled to the grid of the maps)'
+    else:
+        note = ''
+    mask = np.nan_to_num(np.asarray(img.dataobj).squeeze()) > 0
+    return img, mask, path + note
+
+
+def load_subject(sub, cfg):
+    """Maps of one participant inside the ROI mask. Returns Y (n_maps x
+    n_voxels), the trial table, the mask of kept ROI voxels (voxels with
+    NaN/inf or constant zero are dropped), the mask image and its path."""
+    import nibabel as nib
+    trials = list_maps(sub, cfg)
+    ref = nib.load(trials.file.iloc[0])
+    mask_img, mask, mpath = get_mask(sub, cfg, ref)
     Y = np.empty((len(trials), mask.sum()))
     for i, f in enumerate(trials.file):
         img = nib.load(f)
         if img.shape[:3] != mask.shape or not np.allclose(img.affine, mask_img.affine, atol=1e-3):
-            raise ValueError(f'{f} is not in the space of the ROI mask')
+            raise ValueError(f'{f} is not on the grid of the other maps')
         Y[i] = np.asarray(img.dataobj).squeeze()[mask]
-    keep = np.isfinite(Y).all(axis=0)
+    keep = np.isfinite(Y).all(axis=0) & (Y != 0).any(axis=0)
     if not keep.all():
-        print(f'  sub-{sub:02d}: dropping {(~keep).sum()} voxels with NaN/inf')
+        print(f'  sub-{sub:02d}: dropping {(~keep).sum()} ROI voxels with NaN/inf '
+              f'or without data')
         Y = Y[:, keep]
-    return Y, trials.drop(columns='file'), keep
+    return Y, trials.drop(columns='file'), keep, mask_img, mpath
 
 
 def infer_runs(Y, trials, tol=1e-4):
@@ -390,53 +467,68 @@ def infer_runs(Y, trials, tol=1e-4):
     return trials, found
 
 
-def prewhiten(Y, trials):
-    """Multivariate noise normalization (Walther et al., 2016; paper, section
-    2.1: PCM assumes independent voxels). The voxel-by-voxel covariance is
-    estimated from the maps after removing run means, shrunk towards a
-    diagonal (Ledoit-Wolf), and Y is multiplied by its inverse square root.
-    Condition means are deliberately not removed: the residual covariance
-    would then depend on the condition-mean noise, which biased the
-    cross-validated variances upwards in simulation. Condition effects are
-    about 1% of the variance, so they hardly affect the estimate. Variances
-    after whitening are in whitened units."""
-    from sklearn.covariance import ledoit_wolf
+def run_residuals(Y, trials):
+    """Maps minus their run means."""
     D = pcm.matrix.indicator(trials.run.values)
-    E = Y - D @ np.linalg.lstsq(D, Y, rcond=None)[0]
-    Sigma, shrink = ledoit_wolf(E, assume_centered=True)
-    w, V = np.linalg.eigh(Sigma)
-    return Y @ (V / np.sqrt(w)) @ V.T, shrink
+    return Y - D @ np.linalg.lstsq(D, Y, rcond=None)[0]
 
 
-def noise_correlation_from_residuals(sub, keep, trials, roi=None, tol=1e-5,
-                                     cache=True):
+def univariate_scale(Y, trials):
+    """Per-voxel noise SD from the run-centered maps (univariate noise
+    normalization). Divides betas by their noise level; leaves t-maps
+    almost unchanged."""
+    E = run_residuals(Y, trials)
+    df = len(Y) - trials.run.nunique()
+    return np.sqrt((E ** 2).sum(0) / df)
+
+
+def prewhiten(Y, trials):
+    """Multivariate noise normalization from the maps themselves (Walther et
+    al., 2016; paper, section 2.1: PCM assumes independent voxels): each voxel
+    is divided by its noise SD, and the correlation between voxels is
+    estimated from the maps after removing run means and removed (shrinkage,
+    see whitener_from_samples). Condition means are deliberately not removed:
+    the estimate would then depend on the condition-mean noise, which biased
+    the cross-validated variances upwards in simulation. Condition effects
+    are about 1% of the variance, so they hardly affect the estimate.
+    Returns the whitened Y and the whitener."""
+    sd = univariate_scale(Y, trials)
+    Ys = Y / sd
+    z = whitener_from_samples(run_residuals(Ys, trials))
+    return whiten(Ys, z), z
+
+
+FULL_WHITEN_MAX = 20000  # voxels; above this, the low-rank whitening is used
+                         # (20,000 voxels: ~3 GB per matrix; lower it on small machines)
+LOWRANK_K = 1000         # noise components kept by the low-rank whitening
+
+
+def noise_whitener(sub, keep, trials, mask_img, cfg, cache=True, tol=1e-5):
     """Spatial noise correlation of the ROI voxels from the GLM residual time
-    series (Walther et al., 2016; paper, section 2.1), pooled over runs.
+    series of the FIR model (Walther et al., 2016; paper, section 2.1),
+    pooled over runs (whiten=residuals; FIR t-maps).
 
-    * Each run's residuals span only n_volumes - n_regressors dimensions, so
-      each run is reduced to its numerical rank (via SVD; the residual cross-
-      product is unchanged). The shrinkage then uses the true residual
-      degrees of freedom, not the number of volumes.
-    * The t-maps are already divided by each voxel's noise SD, so the
-      residuals are standardized per voxel and only the correlation between
-      voxels is removed. Shrinkage: Ledoit-Wolf towards the identity.
+    * Each run's residuals are reduced to their numerical rank (via SVD; the
+      residual cross-product is unchanged), so the estimate uses the true
+      residual degrees of freedom, not the number of volumes.
+    * The residuals are standardized per voxel, so only the correlation
+      between voxels is removed (the maps are scaled per voxel beforehand).
+    * Full or low-rank whitening, see whitener_from_samples.
     * The residuals are orthogonal to the trial estimates, so the whitening
-      does not depend on the trial patterns (no bias in the cross-validated
-      estimates).
-    Returns R (n_voxels x n_voxels), shrinkage, df per run, file count."""
-    import glob, os, re
+      does not depend on the trial patterns.
+    Returns a whitener (dict) for whiten(), with summary information."""
+    import glob, os, re, hashlib
     import nibabel as nib
-    from sklearn.covariance import ledoit_wolf
-    cfile = f'pcm_noisecorr_sub-{sub:02d}.npz'
+    key = hashlib.md5(f"{cfg['roi']}|{sub}|resid".encode()).hexdigest()[:8]
+    cfile = f'pcm_noise_sub-{sub:02d}_{key}.npz'          # one cache per ROI
     if cache and os.path.exists(cfile):
-        z = np.load(cfile)
-        if z['R'].shape[0] == keep.sum():
-            return z['R'], float(z['shrink']), z['dfs'], int(z['n_files'])
-    rs = sub + RESID_SUB_OFFSET
-    files = sorted(glob.glob(RESID.format(sub=rs)))
+        z = dict(np.load(cfile))
+        if int(z['P']) == keep.sum():
+            return z
+    rs = sub + cfg.get('resid_offset', RESID_SUB_OFFSET)
+    files = sorted(glob.glob(cfg['resid'].format(sub=rs)))
     if not files:
-        raise FileNotFoundError(f'No residuals for sub-{sub:02d}: {RESID.format(sub=rs)}')
-    # sanity check: same sessions, RUNS_PER_BLOCK runs per block
+        raise FileNotFoundError(f"No residuals for sub-{sub:02d}: {cfg['resid'].format(sub=rs)}")
     ses_res = pd.Series([int(re.search(r'ses-(\d+)', os.path.basename(f))[1]) for f in files])
     exp = trials.groupby('ses').block.nunique() * RUNS_PER_BLOCK
     got = ses_res.value_counts().sort_index()
@@ -444,8 +536,7 @@ def noise_correlation_from_residuals(sub, keep, trials, roi=None, tol=1e-5,
         print(f'  WARNING sub-{sub:02d}: residual runs per session {got.to_dict()} '
               f'do not match {RUNS_PER_BLOCK} x blocks {exp.to_dict()}; '
               f'check RESID_SUB_OFFSET')
-    mask_img = nib.load((roi or ROI).format(sub=sub))
-    mask = np.nan_to_num(np.asarray(mask_img.dataobj).squeeze()) != 0
+    mask = np.nan_to_num(np.asarray(mask_img.dataobj).squeeze()) > 0
     lo = [i.min() for i in np.nonzero(mask)]
     hi = [i.max() + 1 for i in np.nonzero(mask)]
     sub_mask = mask[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
@@ -455,20 +546,71 @@ def noise_correlation_from_residuals(sub, keep, trials, roi=None, tol=1e-5,
         if img.shape[:3] != mask.shape or not np.allclose(img.affine, mask_img.affine, atol=1e-3):
             raise ValueError(f'{f} is not in the space of the ROI mask')
         slab = np.asarray(img.dataobj[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2], :],
-                          dtype=np.float64)
+                          dtype=np.float32)
         E = slab[sub_mask][keep].T                       # volumes x voxels
+        del slab
         E = E[np.isfinite(E).all(axis=1)]
         _, S, Vt = np.linalg.svd(E, full_matrices=False)
         r = int((S > tol * S[0]).sum())
-        parts.append(S[:r, None] * Vt[:r])
+        parts.append((S[:r, None] * Vt[:r]).astype(np.float32))
         dfs.append(r)
     X = np.vstack(parts)
-    X = X / np.sqrt((X ** 2).mean(axis=0))              # unit variance per voxel
-    R, shrink = ledoit_wolf(X, assume_centered=True)
-    dfs = np.array(dfs)
+    del parts
+    z = whitener_from_samples(X)
+    z.update(dfs=np.array(dfs), n_files=len(files))
     if cache:
-        np.savez(cfile, R=R, shrink=shrink, dfs=dfs, n_files=len(files))
-    return R, shrink, dfs, len(files)
+        np.savez(cfile, **z)
+    return z
+
+
+def whitener_from_samples(X):
+    """X: residual samples x voxels (rank-reduced). See noise_whitener."""
+    X = X / np.sqrt((X ** 2).mean(axis=0))              # unit variance per voxel
+    n, P = X.shape
+    z = dict(P=P)
+    if P <= FULL_WHITEN_MAX:
+        from sklearn.covariance import ledoit_wolf
+        R, shrink = ledoit_wolf(X.astype(np.float64), assume_centered=True)
+        w, V = np.linalg.eigh(R)
+        z.update(kind='full', W=((V / np.sqrt(w)) @ V.T).astype(np.float32),
+                 shrink=shrink)
+    else:
+        from sklearn.utils.extmath import randomized_svd
+        # k well below the number of samples, so that the variance left over
+        # (spread over the remaining dimensions) is still estimated sensibly
+        k = int(max(1, min(LOWRANK_K, n // 4, P - 1)))
+        _, sv, Vt = randomized_svd(X, k, n_iter=4, random_state=0)
+        lam = sv ** 2 / n                                # variance of each component
+        c = (P - lam.sum()) / (P - k)                    # remaining variance per dim
+        z.update(kind='lowrank', V=Vt.T.astype(np.float32), lam=lam, c=c,
+                 explained=lam.sum() / P)
+    return z
+
+
+def maps_whitener(Ys, trials, sub, cfg, cache=True):
+    """Whitener estimated from the run-centered, scaled maps (whiten=maps),
+    cached per participant, ROI and estimate."""
+    import os, hashlib
+    key = hashlib.md5(f"{cfg['roi']}|{sub}|{cfg['layout']}|{cfg['estimate']}|maps"
+                      .encode()).hexdigest()[:8]
+    cfile = f'pcm_noise_sub-{sub:02d}_{key}.npz'
+    if cache and os.path.exists(cfile):
+        z = dict(np.load(cfile))
+        if int(z['P']) == Ys.shape[1]:
+            return z
+    z = whitener_from_samples(run_residuals(Ys, trials))
+    if cache:
+        np.savez(cfile, **z)
+    return z
+
+
+def whiten(Y, z):
+    """Y times the inverse square root of the noise correlation."""
+    if str(z['kind']) == 'full':
+        return Y @ z['W']
+    V, lam, c = z['V'], z['lam'], float(z['c'])
+    YV = Y @ V
+    return YV @ (V.T / np.sqrt(lam)[:, None]) + (Y - YV @ V.T) / np.sqrt(c)
 
 
 def map_noise_correlation(Y, trials):
@@ -478,13 +620,10 @@ def map_noise_correlation(Y, trials):
     cond = label_trials(trials, True)
     D = np.c_[pcm.matrix.indicator(cond), pcm.matrix.indicator(trials.run.values)]
     E = Y - D @ np.linalg.lstsq(D, Y, rcond=None)[0]
+    if E.shape[1] > 2000:                                # random subset of voxels
+        E = E[:, np.random.default_rng(0).choice(E.shape[1], 2000, replace=False)]
     C = np.corrcoef(E.T)
     return np.abs(C[np.triu_indices_from(C, 1)]).mean()
-
-
-def whiten_with(Y, R):
-    w, V = np.linalg.eigh(R)
-    return Y @ (V / np.sqrt(w)) @ V.T
 
 
 def make_dataset(Y, trials, with_order=True):
@@ -495,30 +634,59 @@ def make_dataset(Y, trials, with_order=True):
                                                 'part_vec': trials['run'].values})
 
 
-def prepare_subject(sub, kind='tmap_z', whiten=WHITEN):
-    """Loads one participant, recovers the runs and prewhitens.
-    whiten = 'residuals' (GLM residuals, recommended), 'maps' (noise estimated
-    from the t-maps themselves) or None."""
-    Y, trials, keep = load_subject(sub, kind)
-    trials, k = infer_runs(Y, trials)
+def prepare_subject(sub, cfg):
+    """Loads one participant, sets the runs and normalizes the noise.
+    cfg['whiten']:
+      'residuals'  per-voxel SD from the maps + spatial noise correlation from
+                   the FIR GLM residual time series (signal-free; default FIR)
+      'auto'       'residuals' if residual files exist, else 'univariate'
+                   (default LSS)
+      'univariate' per-voxel noise SD only (unbiased; voxel correlations stay)
+      'maps'       correlation estimated from the run-centered maps. Not
+                   recommended: the condition signal is concentrated in few
+                   voxel-space directions, so it is partly whitened away
+                   (shrinks strong components, distorts their ratios).
+      None         no normalization."""
+    Y, trials, keep, mask_img, mpath = load_subject(sub, cfg)
+    if 'run' in trials:                                  # LSS: run in the file name
+        rpb = sorted(trials.groupby('block_id').run.nunique().unique())
+    else:                                                # FIR: from the z-scoring
+        trials, k = infer_runs(Y, trials)
+        rpb = sorted(set(max(x, 1) for x in k))
+    mode = cfg['whiten']
     msg = ''
-    if whiten == 'residuals':
-        R, shrink, dfs, nf = noise_correlation_from_residuals(sub, keep, trials)
+    if mode:
         before = map_noise_correlation(Y, trials)
-        Y = whiten_with(Y, R)
+        Y = Y / univariate_scale(Y, trials)              # every mode: per-voxel SD
+        z = None
+        if mode in ('residuals', 'auto'):
+            try:
+                z = noise_whitener(sub, keep, trials, mask_img, cfg)
+                src = (f"GLM residuals ({int(z['n_files'])} runs, df {z['dfs'].min()}-"
+                       f"{z['dfs'].max()} per run")
+            except FileNotFoundError as e:
+                if mode == 'residuals':
+                    raise
+                msg = f'\n      no GLM residuals found -> univariate normalization only'
+        elif mode == 'maps':
+            z = maps_whitener(Y, trials, sub, cfg)
+            src = f'the maps ({len(Y) - trials.run.nunique()} df'
+        if z is not None:
+            Y = whiten(Y, z)
+            how = (f'shrinkage {float(z["shrink"]):.2f}' if str(z['kind']) == 'full' else
+                   f'low-rank, {len(z["lam"])} components = '
+                   f'{100 * float(z["explained"]):.0f}% of noise variance')
+            msg = f'\n      whitened from {src}, {how})'
+        elif mode == 'univariate':
+            msg = '\n      univariate noise normalization'
         after = map_noise_correlation(Y, trials)
-        msg = (f', whitened with {nf} residual runs (df {dfs.min()}-{dfs.max()} '
-               f'per run, shrinkage {shrink:.2f}); mean |r| between voxels '
-               f'{before:.3f} -> {after:.3f}')
-        if after >= before:
-            print(f'  WARNING sub-{sub:02d}: whitening did not reduce the voxel '
-                  f'correlations of the maps; check RESID_SUB_OFFSET and the space')
-    elif whiten == 'maps':
-        Y, shrink = prewhiten(Y, trials)
-        msg = f', whitened from the maps (shrinkage {shrink:.2f})'
-    print(f'  sub-{sub:02d} {kind}: {len(trials)} maps, {Y.shape[1]} voxels, '
+        msg += f'; mean |r| between voxels {before:.3f} -> {after:.3f}'
+        if z is not None and after >= before:
+            msg += '\n      WARNING: whitening did not reduce the voxel correlations'
+    label = cfg['estimate'] if cfg['layout'] == 'lss' else cfg['kind']
+    print(f'  sub-{sub:02d} {label}: {len(trials)} maps, {Y.shape[1]} voxels, '
           f'{trials.block_id.nunique()} blocks, {trials.run.nunique()} runs '
-          f'(runs per block: {sorted(set(max(x, 1) for x in k))})' + msg)
+          f'(runs per block: {[int(x) for x in rpb]})\n      ROI {mpath}' + msg, flush=True)
     return Y, trials
 
 
@@ -654,14 +822,28 @@ def crossval_table(data, models, theta, scale_prior=1e3):
     return pd.DataFrame(np.c_[LL, no, sc], columns=cols)
 
 
-def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False):
+def _fit_models(data, models, crossval):
+    """Fits a list of models (one worker). Returns (LL or None, theta)."""
+    import warnings
+    warnings.filterwarnings('ignore')
+    if crossval:
+        _, theta = pcm.fit_model_group_crossval(data, models, fit_scale=True,
+                                                verbose=False)
+        return None, theta
+    T, theta = pcm.fit_model_individ(data, models, verbose=False)
+    return T['likelihood'].values, theta
+
+
+def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False,
+            n_jobs=1):
     """Fits every combination of components (model family) to each participant.
     crossval=True : leave-one-participant-out group cross-validation (paper,
                     section 2.7.2 and Fig. 2b; used for component models in
                     section 3.1). Use this for the paper.
     crossval=False: individual fits with an AIC penalty (quick check only).
     fixed         : component names contained in every model; they get no
-                    posterior or variance estimate."""
+                    posterior or variance estimate.
+    n_jobs        : models are fitted in parallel processes."""
     import warnings
     warnings.filterwarnings('ignore', module='PcmPy')
     warnings.filterwarnings('ignore', category=FutureWarning)
@@ -671,15 +853,29 @@ def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False):
     base = [i for i, k in enumerate(names) if k in fixed]
     MF = pcm.model.ModelFamily(Gc[free], comp_names=[names[i] for i in free],
                                basecomponents=Gc[base] if base else None)
+    models = MF.models
+    n_jobs = max(1, min(n_jobs, len(models)))
+    if n_jobs == 1:
+        out = [_fit_models(data, models, crossval)]
+        chunks = [list(range(len(models)))]
+    else:
+        from joblib import Parallel, delayed
+        chunks = [list(range(i, len(models), n_jobs)) for i in range(n_jobs)]
+        out = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_models)(data, [models[j] for j in c], crossval) for c in chunks)
+    theta = [None] * len(models)
+    LL = np.zeros((len(data), len(models)))
+    for c, (ll, th) in zip(chunks, out):
+        for k, j in enumerate(c):
+            theta[j] = th[k]
+            if ll is not None:
+                LL[:, j] = ll[:, k]
     if crossval:
-        _, theta = pcm.fit_model_group_crossval(data, MF.models, fit_scale=True,
-                                                verbose=verbose)
-        T = crossval_table(data, MF.models, theta)
+        T = crossval_table(data, models, theta)
+        LL = T['likelihood'].values
         method = None
     else:
-        T, theta = pcm.fit_model_individ(data, MF.models, verbose=verbose)
         method = 'AIC'
-    LL = T['likelihood'].values
     post = MF.model_posterior(LL, method)
     exptheta = MF.component_exptheta(theta)
     if crossval:
@@ -766,30 +962,42 @@ def swap_binding(trials, rng):
     return out
 
 
-def binding_null(subjects, n_perm=100, pcm_fits=True, seed=0):
+BIND = ['bind_conj', 'bind_specific']
+
+
+def _binding_stats(subj, pcm_fits=True):
+    V = pd.DataFrame([cv_component_variance(Y, t, False) for Y, t in subj])
+    row = {f'{k} cv variance': V[k].mean() for k in BIND}
+    if pcm_fits:
+        data = [make_dataset(Y, t, False) for Y, t in subj]
+        bf = run_pcm(data, False, fixed=['color', 'motion', 'set'])['logBF']
+        row.update({f'{k} mean log BF': bf[k].mean() for k in BIND})
+        row.update({f'{k} n log BF > 1': (bf[k] > 1).sum() for k in BIND})
+    return row
+
+
+def _binding_perm(subj, seed, pcm_fits=True):
+    rng = np.random.default_rng(seed)
+    return _binding_stats([(Y, swap_binding(t, rng)) for Y, t in subj], pcm_fits)
+
+
+def binding_null(subjects, n_perm=100, pcm_fits=True, seed=0, n_jobs=1):
     """subjects: list of (Y, trials). Returns observed statistics and their
     null distributions for bind_conj and bind_specific: mean cv variance and,
     if pcm_fits, mean log BF and n(log BF > 1) from individual fits of a
-    reduced family (color, motion and set in every model; 4 models)."""
-    rng = np.random.default_rng(seed)
-    comps = ['bind_conj', 'bind_specific']
-
-    def stats_for(subj):
-        V = pd.DataFrame([cv_component_variance(Y, t, False) for Y, t in subj])
-        row = {f'{k} cv variance': V[k].mean() for k in comps}
-        if pcm_fits:
-            data = [make_dataset(Y, t, False) for Y, t in subj]
-            bf = run_pcm(data, False, fixed=['color', 'motion', 'set'])['logBF']
-            row.update({f'{k} mean log BF': bf[k].mean() for k in comps})
-            row.update({f'{k} n log BF > 1': (bf[k] > 1).sum() for k in comps})
-        return row
-
-    obs = pd.Series(stats_for(subjects))
-    null = []
-    for i in range(n_perm):
-        null.append(stats_for([(Y, swap_binding(t, rng)) for Y, t in subjects]))
-        if (i + 1) % 10 == 0:
-            print(f'  permutation {i + 1}/{n_perm}')
+    reduced family (color, motion and set in every model; 4 models).
+    Permutations run in n_jobs parallel processes (seed + i each)."""
+    obs = pd.Series(_binding_stats(subjects, pcm_fits))
+    if n_jobs > 1:
+        from joblib import Parallel, delayed
+        null = Parallel(n_jobs=n_jobs, verbose=5)(
+            delayed(_binding_perm)(subjects, seed + i, pcm_fits) for i in range(n_perm))
+    else:
+        null = []
+        for i in range(n_perm):
+            null.append(_binding_perm(subjects, seed + i, pcm_fits))
+            if (i + 1) % 10 == 0:
+                print(f'  permutation {i + 1}/{n_perm}')
     null = pd.DataFrame(null)
     p = {k: (1 + (null[k] >= obs[k]).sum()) / (1 + n_perm) for k in obs.index}
     summary = pd.DataFrame({'observed': obs, 'null mean': null.mean(),
@@ -858,6 +1066,8 @@ def _rdm(G):
 
 def plot_components(path, with_order=True):
     """Model RDMs of the components (distances implied by each G)."""
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     names, Gc, T = build_components(with_order)
     idx, _ = condition_order(with_order)
@@ -878,6 +1088,8 @@ def plot_results(Gs, V, stats, with_order, path):
     """Group-average cross-validated RDM, component RDMs and component
     variances (mean +- SE, participants as dots, sign-flip p-values).
     Gs: participants x n x n cross-validated G; V: participants x components."""
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
     names, Gc, T = build_components(with_order)
@@ -933,12 +1145,34 @@ def plot_results(Gs, V, stats, with_order, path):
     plt.close(fig)
 
 
+def roi_spec(spec, base):
+    """'anat/V1'                -> roi_anat/sub-XX/V1_resampled.nii.gz, else V1.nii.gz
+    'func/early_visual/top0700' -> roi_func/sub-XX/early_visual/top0700_resampled.nii.gz,
+                                   else top0700.nii.gz
+    A spec ending in .nii or .nii.gz is used as given (relative to
+    roi_<kind>/sub-XX/). Masks on another grid are resampled to the maps.
+    Returns the path template ('|' separates candidates) and the output tag."""
+    import os
+    kind, rest = spec.strip().split('/', 1)
+    root = f'{base}/roi_{kind}/sub-{{sub:02d}}/'
+    if rest.endswith(('.nii', '.nii.gz')):
+        tmpl = root + rest
+    else:
+        tmpl = f'{root}{rest}_resampled.nii.gz|{root}{rest}.nii.gz'
+    name = os.path.basename(rest).split('.')[0].replace('_resampled', '')
+    return tmpl, f'_{kind}_{name}'
+
+
 def analyse(subjects, ids, crossval=False, ceiling=False, n_null=0, tag='',
-            orders=(False, True)):
-    """subjects: list of (Y, trials) after infer_runs / prewhiten.
-    orders: (False,) = 18 conditions only, (False, True) = 18 and 36."""
+            orders=(False, True), n_jobs=1, crossval36=False):
+    """subjects: list of (Y, trials) after prepare_subject.
+    orders: (False,) = 18 conditions only, (False, True) = 18 and 36.
+    crossval applies to 18 conditions; to 36 only with crossval36 (256
+    models; otherwise AIC fits)."""
+    crossval18 = crossval
     for wo in orders:
         n = 36 if wo else 18
+        crossval = crossval18 and (not wo or crossval36)
         name = f'{n}{tag}{"_cv" if crossval else "_aic"}'
         Gs = np.array([cv_G(Y, t, wo) for Y, t in subjects])
         V = pd.DataFrame([cv_component_variance(Y, t, wo, G)
@@ -953,7 +1187,7 @@ def analyse(subjects, ids, crossval=False, ceiling=False, n_null=0, tag='',
         plot_results(Gs, V, cvs, wo, f'pcm_results_{n}{tag}.png')
 
         data = [make_dataset(Y, t, wo) for Y, t in subjects]
-        res = run_pcm(data, wo, crossval)
+        res = run_pcm(data, wo, crossval, n_jobs=n_jobs)
         summ = summarize_pcm(res)
         print(f'\n{n} conditions: model family, '
               f'{"group cross-validation" if crossval else "individual fits, AIC"}')
@@ -970,20 +1204,44 @@ def analyse(subjects, ids, crossval=False, ceiling=False, n_null=0, tag='',
 
     if n_null:
         print(f'\nBinding null, 18 conditions, {n_null} permutations')
-        summ, null = binding_null(subjects, n_null)
+        summ, null = binding_null(subjects, n_null, n_jobs=n_jobs)
         print(summ.to_string())
         summ.to_csv(f'pcm_bindingnull_summary{tag}.csv')
         null.to_csv(f'pcm_bindingnull_distribution{tag}.csv')
 
 
+def _arg(args, key, default=None, cast=str):
+    v = next((a.split('=', 1)[1] for a in args if a.startswith(key + '=')), None)
+    return default if v is None else cast(v)
+
+
 if __name__ == '__main__':
     import sys, glob, os, re
     args = sys.argv[1:]
-    cv, ceil = 'cv' in args, 'ceiling' in args
-    whiten = (None if 'nowhiten' in args else 'maps' if 'whiten=maps' in args
-              else WHITEN)
-    n_null = next((int(a.split('=')[1]) for a in args if a.startswith('null=')), 0)
+    cv, ceil, cv36 = 'cv' in args, 'ceiling' in args, 'cv36' in args
+    n_null = _arg(args, 'null', 0, int)
     orders = (False,) if 'only18' in args else (False, True)
+    jobs = _arg(args, 'jobs', 1, int)
+    # loading + whitening a large mask needs up to ~15 GB per process
+    loadjobs = _arg(args, 'loadjobs', min(jobs, 8), int)
+    base = _arg(args, 'base', BASE)
+    cfg = default_config(
+        layout=_arg(args, 'layout', LAYOUT), base=base,
+        lss_dir=_arg(args, 'lss', base + '/lss' if 'base=' in ' '.join(args) else LSS_DIR),
+        estimate=_arg(args, 'estimate', ESTIMATE),
+        resid=_arg(args, 'resid', RESID),
+        resid_offset=_arg(args, 'resid_offset', RESID_SUB_OFFSET, int),
+        whiten='none' if 'nowhiten' in args else _arg(args, 'whiten', None))
+    roi_arg = _arg(args, 'roi')
+    rois = ([roi_spec(r, base) for r in roi_arg.split(',')] if roi_arg else [(ROI, '')])
+    sub_arg = _arg(args, 'subs')
+    if sub_arg:
+        SUBJECTS = [int(x) for x in sub_arg.replace(' ', ',').split(',') if x]
+    out = _arg(args, 'out')
+    if out:
+        os.makedirs(out, exist_ok=True)
+        os.chdir(out)
+
     check_design(False)
     check_design(True)
     plot_components('pcm_components_18.png', False)
@@ -998,17 +1256,31 @@ if __name__ == '__main__':
             t, k = infer_runs(Y, t)
             ok = pd.crosstab(t.run, t.run_true).gt(0).sum(1).eq(1).all()
             print(f'  runs recovered: {ok} (runs per block: {sorted(set(k))})')
-            if whiten:              # no residuals in the simulation
-                Y, _ = prewhiten(Y, t)
+            if cfg['whiten']:          # no residuals in the simulation
+                Y = Y / univariate_scale(Y, t)
             subjects.append((Y, t))
         analyse(subjects, list(range(1, len(subjects) + 1)), cv, ceil, n_null, '_sim',
-                orders=orders)
+                orders=orders, n_jobs=jobs, crossval36=cv36)
 
     if 'real' in args:
         check_trial_types()
-        subs = SUBJECTS or sorted(
-            int(re.fullmatch(r'sub-(\d+)', os.path.basename(d))[1])
-            for d in glob.glob(BASE + '/firestimates/sub-*'))
-        print('\nLoading tmap_z')
-        subjects = [prepare_subject(s, 'tmap_z', whiten) for s in subs]
-        analyse(subjects, subs, cv, ceil, n_null, orders=orders)
+        src = (f"{cfg['lss_dir']}/sub-*" if cfg['layout'] == 'lss'
+               else f"{cfg['base']}/firestimates/sub-*")
+        subs = SUBJECTS or sorted(int(re.fullmatch(r'sub-(\d+)', os.path.basename(d))[1])
+                                  for d in glob.glob(src) if os.path.isdir(d))
+        est_tag = ('_' + cfg['estimate'].replace('/', '-')) if cfg['layout'] == 'lss' else ''
+        print(f"\nlayout {cfg['layout']}"
+              + (f", estimate {cfg['estimate']}" if cfg['layout'] == 'lss' else '')
+              + f", whitening {cfg['whiten']}, {len(subs)} participants, "
+              f"{jobs} jobs, output in {os.getcwd()}")
+        for roi, tag in rois:
+            c = dict(cfg, roi=roi)
+            print(f'\n=== ROI {roi}', flush=True)
+            if loadjobs > 1:
+                from joblib import Parallel, delayed
+                subjects = Parallel(n_jobs=min(loadjobs, len(subs)))(
+                    delayed(prepare_subject)(s, c) for s in subs)
+            else:
+                subjects = [prepare_subject(s, c) for s in subs]
+            analyse(subjects, subs, cv, ceil, n_null, tag=est_tag + tag,
+                    orders=orders, n_jobs=jobs, crossval36=cv36)
