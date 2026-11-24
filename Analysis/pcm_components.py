@@ -12,18 +12,28 @@ motion1 != motion2.
 The condition space is split into orthogonal subspaces; each component is the
 second moment (G) of one subspace (component model, paper eq. 4):
 
-    dims (18 / 36)   component       what it captures
-    2 / 2            color           which two colors are held
-    2 / 2            motion          which two directions are held
-    4 / 4            set             color pair x direction pair (no binding)
-    4 / 4            bind_conj       binding via conjunction patterns shared
-                                     across sets
-    5 / 5            bind_specific   binding specific to each set
-    - / 2            color_order     color x serial position (additive)
-    - / 2            motion_order    direction x serial position (additive)
-    - / 4            object_order    object x serial position, beyond the two
-                                     additive order codes
-    - / 10           (not modeled)   remaining set-specific order variance
+    dims (18 / 36)   component        what it captures
+    features, no binding
+      2 / 2          color            which two colors are held
+      2 / 2          motion           which two directions are held
+      4 / 4          set              color pair x direction pair (features only)
+    binding
+      4 / 4          bind_object      object-specific binding: one pattern per
+                                      color-direction object, reused in every
+                                      set that contains the object
+      5 / 5          bind_set         set-specific binding: the pairing coded
+                                      per set (whole display), not shared
+      - / 2          color_position   color x serial position  } pointer codes;
+      - / 2          motion_position  direction x serial pos.  } both together =
+                     bind_pointer     content-independent (pointer) binding,
+                                      reported as their conjunction
+      - / 4          object_position  object x serial position (object in a slot)
+      - / 10         (not modeled)    remaining set-specific order variance
+
+Content-independent (pointer) binding: color and direction are each tied to a
+shared index, here the serial position. It predicts color_position AND
+motion_position > 0, with zero bind_object / bind_set once order is
+averaged; it can only be seen in the 36-condition analysis.
 
 Analysis, following the paper:
   * Data: one delay-period map per trial, all ROI voxels: FIR t-maps
@@ -48,9 +58,9 @@ Analysis, following the paper:
   * Binding null: block-wise random swaps of binding configurations.
 
 Usage (arguments in any order):
-  python pcm_binding.py simulate                 recovery check on simulated data
-  python pcm_binding.py real                     cv variances + AIC model family
-  python pcm_binding.py real cv ceiling null=100 analysis for the paper
+  python pcm_components.py simulate                 recovery check on simulated data
+  python pcm_components.py real                     cv variances + AIC model family
+  python pcm_components.py real cv ceiling null=100 analysis for the paper
 Options:
   layout=fir|lss        input maps (default fir = FIR t-maps, tmap_z)
   estimate=hrf/beta/del LSS estimate folder <model>/<stat>/<window>
@@ -183,15 +193,15 @@ def build_components(with_order=True):
     P_bind = _proj(F['bind'])                            # within-set binding, 9 dims
     P_bconj = _proj(P_bind @ F['conj'])                  # shared conjunctions, 4 dims
     comps = {'color': P_col, 'motion': P_mot, 'set': P_set,
-             'bind_conj': P_bconj, 'bind_specific': P_bind - P_bconj}
+             'bind_object': P_bconj, 'bind_set': P_bind - P_bconj}
     if with_order:
         P_co, P_mo = _proj(F['co']), _proj(F['mo'])      # order subspaces, 9 dims each
         P_cpos = _proj(F['color_pos'])                   # lies inside P_co, 2 dims
         P_mpos = _proj(F['motion_pos'])                  # lies inside P_mo, 2 dims
         R = P_co + P_mo - P_cpos - P_mpos
         P_obj = _proj(R @ F['obj_pos'])                  # 4 dims
-        comps.update({'color_order': P_cpos, 'motion_order': P_mpos,
-                      'object_order': P_obj})
+        comps.update({'color_position': P_cpos, 'motion_position': P_mpos,
+                      'object_position': P_obj})
     names = list(comps)
     Gc = np.stack([comps[k] * n / np.trace(comps[k]) for k in names])
     return names, Gc, T
@@ -212,7 +222,7 @@ def check_design(with_order=True):
         for i, r in T.iterrows():
             Zadd[i, [r.color1, 3 + r.color2, 6 + r.motion1, 9 + r.motion2]] = 1
         P_bind = _proj(F['bind'])
-        print(f'  additive feature x order code -> binding: {np.abs(P_bind @ Zadd).max():.1e}')
+        print(f'  additive feature x position (pointer) code -> binding: {np.abs(P_bind @ Zadd).max():.1e}')
 
 
 # ----------------------------------------------------------------------------
@@ -519,7 +529,8 @@ def noise_whitener(sub, keep, trials, mask_img, cfg, cache=True, tol=1e-5):
     Returns a whitener (dict) for whiten(), with summary information."""
     import glob, os, re, hashlib
     import nibabel as nib
-    key = hashlib.md5(f"{cfg['roi']}|{sub}|resid".encode()).hexdigest()[:8]
+    key = hashlib.md5(f"{cfg['roi']}|{sub}|{cfg['resid']}|{cfg.get('resid_offset')}"
+                      .encode()).hexdigest()[:8]
     cfile = f'pcm_noise_sub-{sub:02d}_{key}.npz'          # one cache per ROI
     if cache and os.path.exists(cfile):
         z = dict(np.load(cfile))
@@ -565,9 +576,14 @@ def noise_whitener(sub, keep, trials, mask_img, cfg, cache=True, tol=1e-5):
 
 def whitener_from_samples(X):
     """X: residual samples x voxels (rank-reduced). See noise_whitener."""
-    X = X / np.sqrt((X ** 2).mean(axis=0))              # unit variance per voxel
+    sd = np.sqrt((X ** 2).mean(axis=0))
+    n_zero = int((sd == 0).sum())
+    if n_zero:
+        print(f'      note: {n_zero} ROI voxels have no residual variance '
+              f'(outside the saved mask); treated as uncorrelated')
+    X = X / np.where(sd > 0, sd, 1.0)                    # unit variance per voxel
     n, P = X.shape
-    z = dict(P=P)
+    z = dict(P=P, n_zero=n_zero)
     if P <= FULL_WHITEN_MAX:
         from sklearn.covariance import ledoit_wolf
         R, shrink = ledoit_wolf(X.astype(np.float64), assume_centered=True)
@@ -786,11 +802,20 @@ def signflip_test(V, n_perm=100000, max_exact=20, seed=0):
 def summarize_cv(V):
     """V: participants x components (cv variance). Mean, SE and the sign-flip
     permutation test (one-sided), uncorrected and FWE-corrected over
-    components."""
+    components. With 36 conditions, bind_pointer is the conjunction of
+    color_position and motion_position (minimum statistic, Nichols et al.,
+    2005): its t is the smaller t, its p the larger p of the two."""
     out = pd.DataFrame({'mean (x1e-3)': V.mean() * 1e3,
                         'SE (x1e-3)': V.sem() * 1e3,
                         'n > 0': (V > 0).sum()})
     out = out.join(signflip_test(V))
+    if {'color_position', 'motion_position'} <= set(V.columns):
+        a, b = out.loc['color_position'], out.loc['motion_position']
+        out.loc['bind_pointer'] = {
+            'mean (x1e-3)': np.nan, 'SE (x1e-3)': np.nan,
+            'n > 0': int(((V.color_position > 0) & (V.motion_position > 0)).sum()),
+            't': min(a.t, b.t), 'p perm': max(a['p perm'], b['p perm']),
+            'p perm FWE': max(a['p perm FWE'], b['p perm FWE'])}
     return out[['mean (x1e-3)', 'SE (x1e-3)', 't', 'p perm', 'p perm FWE', 'n > 0']].round(4)
 
 
@@ -881,10 +906,22 @@ def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False,
     if crossval:
         exptheta = exptheta * T['scale'].values[None]
     cn = list(MF.comp_names)
+    posterior = MF.component_posterior(LL, method=method, format='DataFrame')
+    logBF = MF.component_bayesfactor(LL, method=method, format='DataFrame')
+    variance = pd.DataFrame((exptheta * post[None]).sum(axis=2).T, columns=cn)
+    if {'color_position', 'motion_position'} <= set(cn):
+        # pointer binding: posterior that BOTH position codes are present,
+        # summed over the models that contain both (prior 1/4)
+        both = (MF.combinations[:, cn.index('color_position')] *
+                MF.combinations[:, cn.index('motion_position')]).astype(bool)
+        P = np.clip(post[:, both].sum(axis=1), 1e-18, None)
+        Q = np.clip(post[:, ~both].sum(axis=1), 1e-18, None)
+        prior = both.mean()
+        posterior['bind_pointer'] = P / (P + Q)
+        logBF['bind_pointer'] = np.log(P) - np.log(Q) - np.log(prior / (1 - prior))
+        variance['bind_pointer'] = np.nan
     return dict(
-        posterior=MF.component_posterior(LL, method=method, format='DataFrame'),
-        logBF=MF.component_bayesfactor(LL, method=method, format='DataFrame'),
-        variance=pd.DataFrame((exptheta * post[None]).sum(axis=2).T, columns=cn),
+        posterior=posterior, logBF=logBF, variance=variance,
         LL=pd.DataFrame(LL, columns=MF.model_names), family=MF,
         crossval=crossval)
 
@@ -962,7 +999,7 @@ def swap_binding(trials, rng):
     return out
 
 
-BIND = ['bind_conj', 'bind_specific']
+BIND = ['bind_object', 'bind_set']
 
 
 def _binding_stats(subj, pcm_fits=True):
@@ -983,7 +1020,7 @@ def _binding_perm(subj, seed, pcm_fits=True):
 
 def binding_null(subjects, n_perm=100, pcm_fits=True, seed=0, n_jobs=1):
     """subjects: list of (Y, trials). Returns observed statistics and their
-    null distributions for bind_conj and bind_specific: mean cv variance and,
+    null distributions for bind_object and bind_set: mean cv variance and,
     if pcm_fits, mean log BF and n(log BF > 1) from individual fits of a
     reduced family (color, motion and set in every model; 4 models).
     Permutations run in n_jobs parallel processes (seed + i each)."""
@@ -1248,8 +1285,8 @@ if __name__ == '__main__':
     plot_components('pcm_components_36.png', True)
 
     if 'simulate' in args:
-        truth = {'color': .01, 'motion': .03, 'set': .005, 'bind_conj': .01,
-                 'color_order': .01}
+        truth = {'color': .01, 'motion': .03, 'set': .005, 'bind_object': .01,
+                 'color_position': .01}
         print('\ntrue variance per condition:', truth)
         subjects = []
         for Y, t in simulate(truth):

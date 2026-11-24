@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-03b_average_runs.py
+03_average.py
 ===================
 
 Pair averaging of LSS single-trial estimates WITHOUT z-scoring, for every
@@ -17,10 +17,18 @@ The single-trial maps already carry block and run in their names, so the
 trial-level analyses (temporal_order, binding_interaction) read them directly
 from trials/ (07_decoding.py --layout lss).
 
+With --zscore run, every voxel is first z-scored across the trial maps of each
+run, as 03_postprocess_tmaps.py does for the original FIR model. --ddof 1 uses
+the sample SD like nilearn's standardize="zscore_sample" there (output folder
+<window>_zrun_ddof1); the default --ddof 0 keeps the earlier behaviour and
+folder <window>_zrun.
+
 Usage
 -----
     python 03b_average_runs.py --subject 01 --input-dir .../lss
     (optionally --estimates hrf/beta/del fir/beta/del to restrict)
+    python 03_average.py --subject 01 --input-dir .../lss --estimates fir/tmap/del \\
+        --zscore run --ddof 1        # as the original FIR pipeline
 """
 
 from __future__ import annotations
@@ -31,6 +39,8 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+
+Z_SUFFIXES = ("_zrun", "_zall", "_zrun_ddof1", "_zall_ddof1")
 
 
 def parse_name(p: Path) -> dict:
@@ -64,6 +74,11 @@ def parse_args() -> argparse.Namespace:
                         "maps of the folder ('all'). The z-scored trials and their pairs go to "
                         "a sibling folder <window>_zrun / <window>_zall; the original folder "
                         "is not changed. Default 'none': plain pair averaging.")
+    p.add_argument("--ddof", type=int, choices=[0, 1], default=0,
+                   help="SD used for the z-scoring: 0 (default; population SD, folders "
+                        "<window>_zrun/_zall) or 1 (sample SD, as nilearn's "
+                        "standardize='zscore_sample' in 03_postprocess_tmaps.py; folders "
+                        "<window>_zrun_ddof1/_zall_ddof1).")
     return p.parse_args()
 
 
@@ -92,12 +107,12 @@ def average_estimate(est_dir: Path, sub: str, force: bool) -> tuple:
     return n_avg, n_skip
 
 
-def zscore_estimate(est_dir: Path, sub: str, mode: str, force: bool) -> tuple:
+def zscore_estimate(est_dir: Path, sub: str, mode: str, force: bool, ddof: int = 0) -> tuple:
     """z-score every voxel across the trial maps of each run (mode 'run') or of
-    the whole folder (mode 'all'), with mean and SD (ddof=0) of that group.
+    the whole folder (mode 'all'), with mean and SD (ddof 0 or 1) of that group.
     Voxels without variance (e.g. outside the brain) become 0. Writes
-    <window>_z<mode>/trials/ next to est_dir; returns (folder, n maps)."""
-    out_dir = est_dir.parent / f"{est_dir.name}_z{mode}"
+    <window>_z<mode>[_ddof1]/trials/ next to est_dir; returns (folder, n maps)."""
+    out_dir = est_dir.parent / (f"{est_dir.name}_z{mode}" + ("_ddof1" if ddof == 1 else ""))
     (out_dir / "trials").mkdir(parents=True, exist_ok=True)
     groups = defaultdict(list)
     for p in sorted((est_dir / "trials").glob(f"sub-{sub}_ses-*_block-*_run-*_trial-*.nii.gz")):
@@ -114,8 +129,12 @@ def zscore_estimate(est_dir: Path, sub: str, mode: str, force: bool) -> tuple:
             d = nib.load(str(p)).get_fdata(dtype=np.float64)
             s1 = d.copy() if s1 is None else s1 + d
             s2 = d * d if s2 is None else s2 + d * d
-        mu = s1 / len(ps)
-        sd = np.sqrt(np.maximum(s2 / len(ps) - mu * mu, 0.0))
+        k = len(ps)
+        mu = s1 / k
+        var = np.maximum(s2 / k - mu * mu, 0.0)
+        if ddof == 1 and k > 1:
+            var *= k / (k - 1)                           # sample variance
+        sd = np.sqrt(var)
         ok = sd > 1e-12
         for p, o in zip(ps, outs):                       # pass 2: write z maps
             img = nib.load(str(p)); d = img.get_fdata(dtype=np.float64)
@@ -134,14 +153,14 @@ def main() -> None:
     if args.estimates:
         ests = [d for d in ests if rel[d] in args.estimates]
     if args.zscore != "none":                        # never z-score a z-scored folder again
-        ests = [d for d in ests if not d.name.endswith(("_zrun", "_zall"))]
+        ests = [d for d in ests if not d.name.endswith(Z_SUFFIXES)]
     if not ests:
         raise SystemExit(f"No <model>/<stat>/<window>/trials/ folders under {sub_dir}")
     if args.zscore != "none":
-        print(f"z-scoring ({args.zscore}), then pair averaging: sub-{args.subject}, "
-              f"{len(ests)} window folders")
+        print(f"z-scoring ({args.zscore}, ddof {args.ddof}), then pair averaging: "
+              f"sub-{args.subject}, {len(ests)} window folders")
         for d in ests:
-            zdir, n = zscore_estimate(d, args.subject, args.zscore, args.force)
+            zdir, n = zscore_estimate(d, args.subject, args.zscore, args.force, args.ddof)
             n_avg, n_skip = average_estimate(zdir, args.subject, args.force)
             print(f"  {rel[d]:<22} -> {zdir.name}: {n} z maps, {n_avg} pair maps, "
                   f"{n_skip} incomplete pairs skipped")
