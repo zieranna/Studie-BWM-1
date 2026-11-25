@@ -4,8 +4,10 @@
 #
 #   bash gla3_grid.sh [grid folder]        (default: .../decoding_grid on this PC)
 #   NP=10000 bash gla3_grid.sh             fewer permutations for a quick look
+#   INPUTS=hrf_late bash gla3_grid.sh ...  only these inputs (others stay as they are)
 #
-# For every input (fir_orig, lss17, lss25, hrf) and run name:
+# For every input (fir_orig, lss17, lss25, hrf, hrf_late; missing ones are skipped)
+# and run name:
 #   nested-pooled_C1, nested-pooled  -> GLA3_results_decoding_nested.py
 #        one row per ROI, FDR across ROIs
 #   allcounts_C1, allcounts          -> GLA3_results_decoding.py (original)
@@ -21,7 +23,7 @@ G_ORIG=${G_ORIG:-$AN/GLA3_results_decoding.py}
 G_NEST=${G_NEST:-$AN/GLA3_results_decoding_nested.py}
 NP=${NP:-100000}
 ROI_ORDER="V1 V2 V3 V4 early_visual pari dlpfc dlpfc_noSFL visual_all visual_locMT MT_complex"
-INPUTS="fir_orig lss17 lss25 hrf"
+INPUTS=${INPUTS:-"fir_orig lss17 lss25 hrf hrf_late"}    # e.g. INPUTS=hrf_late bash gla3_grid.sh ...
 TAGS="nested-pooled_C1 nested-pooled allcounts_C1 allcounts"
 
 for f in "$G_ORIG" "$G_NEST"; do [ -f "$f" ] || { echo "missing: $f"; exit 1; }; done

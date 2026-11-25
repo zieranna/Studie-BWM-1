@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import re
 import time
 import warnings
 from pathlib import Path
@@ -150,6 +151,15 @@ def fir_sticks(path: Path, frame_times: np.ndarray) -> pd.DataFrame:
         "duration": 0.0, "trial_type": "trial"})          # ALL trials: one regressor set
 
 
+def fmriprep_mask(mp: Path, img):
+    """The run's fMRIPrep brain mask or, if fMRIPrep wrote none, no mask at all
+    (every voxel of the BOLD grid; as 02_trialestimates_lss.py). Never computed."""
+    if mp.exists():
+        return nib.load(str(mp))
+    print(f"  [mask] no fMRIPrep mask ({mp.name}): all voxels (no mask)", flush=True)
+    return nib.Nifti1Image(np.ones(img.shape[:3], np.uint8), img.affine)
+
+
 def resample_nearest(img, target):
     return resample_to_img(img, target, interpolation="nearest", **_RESAMPLE_KW)
 
@@ -188,9 +198,9 @@ def process_run(args, ses, run, fir_delays, save_cache):
         kw.update(add_regs=conf.to_numpy(), add_reg_names=list(conf.columns))
     X = make_first_level_design_matrix(frame_times, sticks, **kw)
 
-    # fitting mask as in 02b: brain mask (or EPI mask) + ROI masks
-    mp = mask_path(args.fmriprep_dir, sub, ses, run)
-    base = nib.load(str(mp)) if mp.exists() else compute_epi_mask(img)
+    # fitting mask as in 02b: fMRIPrep brain mask (none: all voxels; never a
+    # computed mask) + ROI masks
+    base = fmriprep_mask(mask_path(args.fmriprep_dir, sub, ses, run), img)
     fit = np.asanyarray(base.dataobj) > 0
     if args.extra_mask_dir is not None:
         fit |= union_mask([args.extra_mask_dir], base)

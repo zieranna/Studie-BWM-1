@@ -36,6 +36,13 @@ flagged in the log and the QC table (assign_best_run, assign_margin).
     noise estimates, which answers the "implicit baseline" concern while
     keeping the original windows.
 
+Fitting mask: the run's fMRIPrep brain mask (desc-brain_mask). If fMRIPrep
+wrote none for a run, no mask is used (all voxels, as mask_img=False in
+02_trialestimates.py); a mask is never computed from the data. Every voxel is
+fitted independently, so brain voxels get the same values either way. Voxels
+with constant signal (e.g. 0 outside the field of view) are always left out.
+--n-delays sets the FIR length (17 = the paper's trial model, 25 = 30 s).
+
 For every trial and phase, the beta (effect size) and the t map are saved.
 A QC table per run lists residual df and the VIFs of the target regressors.
 
@@ -79,6 +86,7 @@ run-01 + run-02, ...). 07_decoding.py reads this layout with
 from __future__ import annotations
 
 import argparse
+import re
 import time
 import warnings
 from pathlib import Path
@@ -193,6 +201,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--basis", choices=["hrf", "fir"], default="hrf",
                    help="'hrf' (default): canonical HRF, phase events. "
                         "'fir': the paper's FIR windows.")
+    p.add_argument("--n-delays", type=int, default=len(FIR_DELAYS),
+                   help="--basis fir: number of FIR delays (default 25 = 30 s; "
+                        "17 = 20.4 s as the paper's trial model 02_trialestimates.py).")
     p.add_argument("--no-motion", action="store_true",
                    help="Leave out the 6 motion regressors (the original "
                         "FIR model had none).")
@@ -480,13 +491,20 @@ def contrast_maps(con) -> dict:
 _EXTRA_CACHE: dict = {}
 
 
-def build_mask(mp: Path, img, extra_dir: Path | None):
-    """fMRIPrep brain mask (or EPI mask), plus all masks in extra_dir."""
+def fmriprep_mask(mp: Path, img) -> tuple:
+    """(mask image, source): the run's fMRIPrep brain mask or, if fMRIPrep wrote
+    none, no mask at all (every voxel of the BOLD grid). Never computed."""
     if mp.exists():
-        base = nib.load(str(mp))
-    else:
-        print(f"   [warn] no brain mask, using EPI mask instead of {mp.name}")
-        base = compute_epi_mask(img)
+        return nib.load(str(mp)), mp.name
+    print(f"   [mask] no fMRIPrep mask ({mp.name}): fitting all voxels (no mask)",
+          flush=True)
+    full = np.ones(img.shape[:3], np.uint8)
+    return nib.Nifti1Image(full, img.affine), "none (all voxels)"
+
+
+def build_mask(mp: Path, img, extra_dir: Path | None):
+    """fMRIPrep brain mask (see fmriprep_mask), plus all masks in extra_dir."""
+    base, _ = fmriprep_mask(mp, img)
     data = np.asanyarray(base.dataobj) > 0
     if extra_dir is None:
         return base, 0, None
@@ -640,7 +658,14 @@ def process_run(args, ses: str, run: str) -> None:
 # Main
 # ============================================================================
 def main() -> None:
+    global FIR_DELAYS, FIR_WINDOWS
     args = parse_args()
+    if args.basis == "fir":
+        FIR_DELAYS = list(range(1, args.n_delays + 1))
+        dropped = [w for w, d in FIR_WINDOWS.items() if max(d) > args.n_delays]
+        FIR_WINDOWS = {w: d for w, d in FIR_WINDOWS.items() if max(d) <= args.n_delays}
+        if dropped:
+            print(f"[n-delays {args.n_delays}] windows beyond the model left out: {dropped}")
     print("-" * 64)
     import nilearn
     print(f"LSS single-trial estimates for sub-{args.subject} "

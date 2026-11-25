@@ -34,8 +34,11 @@ import numpy as np
 import pandas as pd
 
 CP = Path("/home/annaz/BindingWM/Studie-BWM-1_CP_revision1")
-GRIDS = [CP / "decoding_grid_zrun", CP / "decoding_grid_zrun_step50"]
-INPUTS = {"fir_orig": "FIR original", "lss17": "LSS FIR 17", "lss25": "LSS FIR 25", "hrf": "LSS HRF"}
+GRIDS = [CP / "decoding_grid_zrun", CP / "decoding_grid_zrun_step50",
+         CP / "decoding_grid_zrun_step50_1000", CP / "decoding_grid_zrun_step50_2000"]
+STEP50 = {"step50_1000": "200-1000/50", "step50_2000": "200-2000/50", "step50": "200-3000/50"}
+INPUTS = {"fir_orig": "FIR original", "lss17": "LSS FIR 17", "lss25": "LSS FIR 25",
+          "hrf": "LSS HRF", "hrf_late": "LSS HRF late delay"}
 VARIANTS = {"nested-pooled_C1": "nested, C = 1", "nested-pooled": "nested, C tuned",
             "allcounts_C1": "all counts, C = 1", "allcounts": "all counts, C tuned"}
 ROI_ORDER = ["V1", "V2", "V3", "V4", "early_visual", "pari", "dlpfc", "dlpfc_noSFL",
@@ -50,8 +53,10 @@ def star(p):
 
 def variant_label(grid: Path, tag: str) -> str:
     lab = VARIANTS.get(tag, tag)
-    if "step50" in grid.name and tag.startswith("nested"):
-        lab = lab.replace("nested", "nested 50-steps")
+    if tag.startswith("nested"):
+        for key, rng in STEP50.items():                # most specific first
+            if grid.name.endswith(key):
+                return lab.replace("nested", f"nested {rng}")
     return lab
 
 
@@ -162,7 +167,9 @@ def main() -> None:
     rows_order = list(dict.fromkeys(
         comp.assign(i=comp["input"].map({v: k for k, v in enumerate(INPUTS.values())}).fillna(99),
                     v=comp["variant"].map(lambda s: next((k for k, x in enumerate(VARIANTS.values()) if x in s), 99)),
-                    s=comp["variant"].str.contains("50-steps").astype(int))
+                    s=comp["variant"].str.contains("200-1000").astype(int)
+                      + 2 * comp["variant"].str.contains("200-2000").astype(int)
+                      + 3 * comp["variant"].str.contains("200-3000").astype(int))
         .sort_values(["i", "s", "v"])["row"]))
     tab = comp.pivot_table(index="row", columns="ROI", values="txt", aggfunc="first") \
               .reindex(index=rows_order, columns=rois)

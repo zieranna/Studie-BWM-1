@@ -73,6 +73,10 @@ Options:
   ceiling               noise ceiling (with cv)
   null=N                N binding-null permutations
   only18                skip the 36-condition analysis
+  pcmfixed=color,motion,set   components in every PCM model (default; the model
+                        family then varies only binding and position components:
+                        4 models for 18 conditions, 32 for 36). pcmfixed=none
+                        fits all combinations (32 / 256 models; very slow with cv)
   jobs=N, loadjobs=M    processes for fits/permutations and for loading
   whiten=residuals|auto|univariate|maps|none
                         default: residuals for fir, auto for lss
@@ -847,20 +851,28 @@ def crossval_table(data, models, theta, scale_prior=1e3):
     return pd.DataFrame(np.c_[LL, no, sc], columns=cols)
 
 
-def _fit_models(data, models, crossval):
-    """Fits a list of models (one worker). Returns (LL or None, theta)."""
-    import warnings
+def _fit_models(data, models, crossval, label=''):
+    """Fits a list of models (one worker), one at a time, printing a progress
+    line with the time after each model. Returns (LL or None, theta)."""
+    import time, warnings
     warnings.filterwarnings('ignore')
-    if crossval:
-        _, theta = pcm.fit_model_group_crossval(data, models, fit_scale=True,
-                                                verbose=False)
-        return None, theta
-    T, theta = pcm.fit_model_individ(data, models, verbose=False)
-    return T['likelihood'].values, theta
+    LL, theta = [], []
+    for m in models:
+        t0 = time.time()
+        if crossval:
+            _, th = pcm.fit_model_group_crossval(data, [m], fit_scale=True,
+                                                 verbose=False)
+        else:
+            T, th = pcm.fit_model_individ(data, [m], verbose=False)
+            LL.append(T['likelihood'].values[:, 0])
+        theta.append(th[0])
+        print(f'    {label}model {m.name}: {(time.time() - t0) / 60:.1f} min '
+              f'({time.strftime("%H:%M")})', flush=True)
+    return (np.array(LL).T if LL else None), theta
 
 
 def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False,
-            n_jobs=1):
+            n_jobs=1, label=''):
     """Fits every combination of components (model family) to each participant.
     crossval=True : leave-one-participant-out group cross-validation (paper,
                     section 2.7.2 and Fig. 2b; used for component models in
@@ -880,14 +892,22 @@ def run_pcm(data, with_order=True, crossval=False, fixed=None, verbose=False,
                                basecomponents=Gc[base] if base else None)
     models = MF.models
     n_jobs = max(1, min(n_jobs, len(models)))
+    if label:
+        import time
+        print(f'  {label}{len(models)} models '
+              f'({"group cross-validation" if crossval else "individual fits"}'
+              f'{", always in: " + ", ".join(fixed) if fixed else ""}), '
+              f'{n_jobs} processes, start {time.strftime("%H:%M")}', flush=True)
     if n_jobs == 1:
-        out = [_fit_models(data, models, crossval)]
+        out = [_fit_models(data, models, crossval, label)]
         chunks = [list(range(len(models)))]
     else:
-        from joblib import Parallel, delayed
+        from joblib import Parallel, delayed, parallel_backend
         chunks = [list(range(i, len(models), n_jobs)) for i in range(n_jobs)]
-        out = Parallel(n_jobs=n_jobs)(
-            delayed(_fit_models)(data, [models[j] for j in c], crossval) for c in chunks)
+        with parallel_backend('loky', inner_max_num_threads=1):
+          out = Parallel(n_jobs=n_jobs)(
+              delayed(_fit_models)(data, [models[j] for j in c], crossval, label)
+              for c in chunks)
     theta = [None] * len(models)
     LL = np.zeros((len(data), len(models)))
     for c, (ll, th) in zip(chunks, out):
@@ -974,7 +994,11 @@ def noise_ceiling(subjects, data, res, with_order=False):
             T, _ = pcm.fit_model_individ([d], [M], fit_scale=True, verbose=False)
             store.append(T['likelihood'].values.ravel()[0])
     LL = res['LL']
-    null, full = LL.iloc[:, 0].values, LL.iloc[:, -1].values
+    full = LL.iloc[:, -1].values                       # model with all components
+    n = data[0].obs_descriptors['cond_vec'].max() + 1
+    Tn, _ = pcm.fit_model_individ(data, [pcm.model.FixedModel('null', np.zeros((n, n)))],
+                                  fit_scale=False, verbose=False)
+    null = Tn['likelihood'].values.ravel()             # G = 0: no condition differences
     up, lo = np.array(up), np.array(lo)
     r2 = lambda x: (x - null) / (up - null)
     return pd.DataFrame({'full model': r2(full), 'lower ceiling': r2(lo),
@@ -1026,9 +1050,10 @@ def binding_null(subjects, n_perm=100, pcm_fits=True, seed=0, n_jobs=1):
     Permutations run in n_jobs parallel processes (seed + i each)."""
     obs = pd.Series(_binding_stats(subjects, pcm_fits))
     if n_jobs > 1:
-        from joblib import Parallel, delayed
-        null = Parallel(n_jobs=n_jobs, verbose=5)(
-            delayed(_binding_perm)(subjects, seed + i, pcm_fits) for i in range(n_perm))
+        from joblib import Parallel, delayed, parallel_backend
+        with parallel_backend('loky', inner_max_num_threads=1):
+            null = Parallel(n_jobs=n_jobs, verbose=5)(
+                delayed(_binding_perm)(subjects, seed + i, pcm_fits) for i in range(n_perm))
     else:
         null = []
         for i in range(n_perm):
@@ -1201,7 +1226,8 @@ def roi_spec(spec, base):
 
 
 def analyse(subjects, ids, crossval=False, ceiling=False, n_null=0, tag='',
-            orders=(False, True), n_jobs=1, crossval36=False):
+            orders=(False, True), n_jobs=1, crossval36=False,
+            fixed=('color', 'motion', 'set')):
     """subjects: list of (Y, trials) after prepare_subject.
     orders: (False,) = 18 conditions only, (False, True) = 18 and 36.
     crossval applies to 18 conditions; to 36 only with crossval36 (256
@@ -1224,7 +1250,8 @@ def analyse(subjects, ids, crossval=False, ceiling=False, n_null=0, tag='',
         plot_results(Gs, V, cvs, wo, f'pcm_results_{n}{tag}.png')
 
         data = [make_dataset(Y, t, wo) for Y, t in subjects]
-        res = run_pcm(data, wo, crossval, n_jobs=n_jobs)
+        res = run_pcm(data, wo, crossval, fixed=list(fixed), n_jobs=n_jobs,
+                      label=f'PCM {n} conditions: ')
         summ = summarize_pcm(res)
         print(f'\n{n} conditions: model family, '
               f'{"group cross-validation" if crossval else "individual fits, AIC"}')
@@ -1258,6 +1285,8 @@ if __name__ == '__main__':
     cv, ceil, cv36 = 'cv' in args, 'ceiling' in args, 'cv36' in args
     n_null = _arg(args, 'null', 0, int)
     orders = (False,) if 'only18' in args else (False, True)
+    pf = _arg(args, 'pcmfixed', 'color,motion,set')
+    pcm_fixed = () if pf in ('none', '') else tuple(pf.split(','))
     jobs = _arg(args, 'jobs', 1, int)
     # loading + whitening a large mask needs up to ~15 GB per process
     loadjobs = _arg(args, 'loadjobs', min(jobs, 8), int)
@@ -1297,7 +1326,7 @@ if __name__ == '__main__':
                 Y = Y / univariate_scale(Y, t)
             subjects.append((Y, t))
         analyse(subjects, list(range(1, len(subjects) + 1)), cv, ceil, n_null, '_sim',
-                orders=orders, n_jobs=jobs, crossval36=cv36)
+                orders=orders, n_jobs=jobs, crossval36=cv36, fixed=pcm_fixed)
 
     if 'real' in args:
         check_trial_types()
@@ -1320,4 +1349,4 @@ if __name__ == '__main__':
             else:
                 subjects = [prepare_subject(s, c) for s in subs]
             analyse(subjects, subs, cv, ceil, n_null, tag=est_tag + tag,
-                    orders=orders, n_jobs=jobs, crossval36=cv36)
+                    orders=orders, n_jobs=jobs, crossval36=cv36, fixed=pcm_fixed)
